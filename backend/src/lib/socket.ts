@@ -10,11 +10,11 @@ export function initSocket(httpServer: HttpServer): SocketServer {
     cors: { origin: '*', methods: ['GET', 'POST'] },
   });
 
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
     if (!token) return next(new Error('Authentication required'));
     try {
-      const user = verifyToken(token);
+      const user = await verifyToken(token);
       (socket as any).user = user;
       next();
     } catch {
