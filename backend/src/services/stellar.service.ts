@@ -210,6 +210,19 @@ export class StellarService {
   }
 
   /**
+   * Checks whether an account holds a trustline for the given asset.
+   * Useful as a pre-flight check before submitting payout transactions.
+   */
+  public async hasTrustline(accountPublicKey: string, assetCode: string, assetIssuer: string): Promise<boolean> {
+    const server = this.getHorizonServer();
+    const account = await this.retryHorizonRequest(() => server.loadAccount(accountPublicKey));
+
+    return account.balances.some((balance: any) =>
+      balance.asset_code === assetCode && balance.asset_issuer === assetIssuer
+    );
+  }
+
+  /**
    * Convert Stellar signers to our SignerInfo format
    */
   public convertToSignerInfo(accountSigners: AccountSigners): SignerInfo[] {
