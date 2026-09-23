@@ -191,7 +191,7 @@ app.get('/', (req: Request, res: Response) => {
  * /health:
  *   get:
  *     summary: Health check
- *     description: Check if the API server and its backend dependencies (database, Redis, Soroban RPC) are running
+ *     description: Check if the API server and its backend dependencies (database, Redis, Soroban RPC, Horizon) are running
  *     tags: [Health]
  *     responses:
  *       200:
@@ -219,6 +219,9 @@ app.get('/', (req: Request, res: Response) => {
  *                     sorobanRpc:
  *                       type: string
  *                       example: UP
+ *                     horizon:
+ *                       type: string
+ *                       example: UP
  *       503:
  *         description: One or more backend dependencies are down
  *         content:
@@ -244,12 +247,16 @@ app.get('/', (req: Request, res: Response) => {
  *                     sorobanRpc:
  *                       type: string
  *                       example: DOWN
+ *                     horizon:
+ *                       type: string
+ *                       example: DOWN
  */
 app.get('/health', async (req: Request, res: Response) => {
   let dbStatus = 'UP';
   let redisStatus = 'UP';
   let redisLatency = 0;
   let sorobanRpcStatus = 'UP';
+  let horizonStatus = 'UP';
   let isHealthy = true;
 
   try {
@@ -287,6 +294,18 @@ app.get('/health', async (req: Request, res: Response) => {
     logger.error('Health Check - Soroban RPC connection failed:', err);
   }
 
+  try {
+    const horizonHealth = await stellarService.getHorizonHealth();
+    horizonStatus = horizonHealth.status;
+    if (horizonHealth.status === 'DOWN') {
+      isHealthy = false;
+    }
+  } catch (err) {
+    horizonStatus = 'DOWN';
+    isHealthy = false;
+    logger.error('Health Check - Horizon connection failed:', err);
+  }
+
   const responsePayload = {
     status: isHealthy ? 'UP' : 'DOWN',
     timestamp: new Date().toISOString(),
@@ -294,6 +313,7 @@ app.get('/health', async (req: Request, res: Response) => {
       database: dbStatus,
       redis: { status: redisStatus, latencyMs: redisLatency },
       sorobanRpc: sorobanRpcStatus,
+      horizon: horizonStatus,
     },
   };
 

@@ -462,6 +462,21 @@ export class StellarService {
       return { status: 'DOWN' };
     }
   }
+
+  /**
+   * Health check for Horizon connectivity
+   */
+  public async getHorizonHealth(): Promise<{ status: 'UP' | 'DOWN' }> {
+    try {
+      const server = this.getHorizonServer();
+      // Lightweight, low-cost endpoint used purely as a connectivity check
+      await server.fetchBaseFee();
+      return { status: 'UP' };
+    } catch (error) {
+      logger.error('Horizon health check failed:', error);
+      return { status: 'DOWN' };
+    }
+  }
 }
 
 export const stellarService = StellarService.getInstance();
