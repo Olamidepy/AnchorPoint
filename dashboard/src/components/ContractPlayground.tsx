@@ -234,12 +234,14 @@ export function parseContractSpec(specJson: string): ContractSpec {
 }
 
 interface ContractPlaygroundProps {
+  apiBaseUrl?: string;
   initialSpecs?: ContractSpec[];
   defaultWalletAddress?: string;
   onExecuteMethod?: (methodName: string, args: Record<string, any>) => Promise<ExecutionResult> | ExecutionResult;
 }
 
 export const ContractPlayground: React.FC<ContractPlaygroundProps> = ({
+  apiBaseUrl = 'http://localhost:3002',
   initialSpecs = PRESET_CONTRACTS,
   defaultWalletAddress = 'GA2C5RFPE6GCKMY3US5PAB6UZLKIGAHWKXX2G2ZVOUSW4WQHIFRHZSXO',
   onExecuteMethod

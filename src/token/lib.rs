@@ -1,23 +1,55 @@
 #![no_std]
 //! SEP-41 Compatible Token Wrapper
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, String,
+};
+
+/// Maximum number of token transfers allowed in a single batch operation.
+const MAX_BATCH_SIZE: u32 = 100;
+
+/// Contract-level errors returned by batch operations.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ContractError {
+    /// `token_ids` and `amounts` vectors have different lengths.
+    VectorLengthMismatch = 1,
+    /// The batch exceeds the maximum allowed size (100 transfers).
+    BatchTooLarge = 2,
+}
 
 #[contracttype]
 pub enum DataKey {
     Admin,
-    Balance(Address),
-    Allowance(Address, Address),
-    TotalSupply,
+    Balance(u64, Address),
+    Allowance(u64, Address, Address),
+    OperatorApproval(Address, Address),
+    TotalSupply(u64),
+    TokenMetadata(u64),
     Name,
     Symbol,
     Decimals,
-    Registry,
+    PermitNonce(u64, Address, Address),
+    UserLastLedger(u64, Address),
+    BalanceSnapshot(u64, Address, u32),
+}
+
+/// A spender allowance together with the ledger sequence at which it lapses.
+///
+/// `expiration_ledger` is inclusive: the allowance is spendable while
+/// `env.ledger().sequence() <= expiration_ledger`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AllowanceValue {
+    pub amount: i128,
+    pub expiration_ledger: u32,
 }
 
 #[contract]
 pub struct TokenContract;
 
+#[allow(deprecated)]
 #[contractimpl]
 impl TokenContract {
     pub fn initialize(env: Env, admin: Address, decimals: u32, name: String, symbol: String) {
@@ -29,88 +61,370 @@ impl TokenContract {
         env.storage().instance().set(&DataKey::Decimals, &decimals);
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
-        env.storage().instance().set(&DataKey::TotalSupply, &0_i128);
     }
 
-    pub fn set_registry(env: Env, registry: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("not initialized");
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Registry, &registry);
-    }
-
-    pub fn mint(env: Env, to: Address, amount: i128) {
-        Self::ensure_not_paused(&env);
+    pub fn mint(env: Env, to: Address, token_id: u64, amount: i128) {
         assert!(amount > 0, "amount must be positive");
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
         admin.require_auth();
-        let bal = Self::balance_of(env.clone(), to.clone());
-        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(bal + amount));
-        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalSupply, &(supply + amount));
-        env.events().publish((symbol_short!("mint"), to), amount);
+
+        let bal = Self::balance_of(env.clone(), to.clone(), token_id);
+        env.storage().persistent().set(
+            &DataKey::Balance(token_id, to.clone()),
+            &bal.checked_add(amount).expect("balance overflow"),
+        );
+
+        let supply: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSupply(token_id))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::TotalSupply(token_id),
+            &supply.checked_add(amount).expect("supply overflow"),
+        );
+
+        // Topic: event name + token_id (u64 scalar); to + amount in data.
+        env.events()
+            .publish((symbol_short!("mint"), token_id), (to, amount));
     }
 
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        Self::ensure_not_paused(&env);
+    pub fn transfer(env: Env, from: Address, to: Address, token_id: u64, amount: i128) {
         from.require_auth();
-        assert!(amount > 0, "amount must be positive");
-        let from_bal = Self::balance_of(env.clone(), from.clone());
-        assert!(from_bal >= amount, "insufficient balance");
-        env.storage().persistent().set(&DataKey::Balance(from.clone()), &(from_bal - amount));
-        let to_bal = Self::balance_of(env.clone(), to.clone());
-        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(to_bal + amount));
-        env.events().publish((symbol_short!("transfer"), from, to), amount);
+        Self::do_transfer(&env, from, to, token_id, amount);
     }
 
-    pub fn approve(env: Env, owner: Address, spender: Address, amount: i128) {
-        Self::ensure_not_paused(&env);
+    pub fn batch_transfer(
+        env: Env,
+        from: Address,
+        to: Address,
+        token_ids: soroban_sdk::Vec<u64>,
+        amounts: soroban_sdk::Vec<i128>,
+    ) -> Result<(), ContractError> {
+        from.require_auth();
+
+        // Validate that both vectors have the same length.
+        if token_ids.len() != amounts.len() {
+            return Err(ContractError::VectorLengthMismatch);
+        }
+
+        // Enforce max batch size to prevent resource exhaustion.
+        if token_ids.len() > MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
+        for i in 0..token_ids.len() {
+            let token_id = token_ids.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            Self::do_transfer(&env, from.clone(), to.clone(), token_id, amount);
+        }
+
+        // Topic: event name only; from + to + token_ids in data.
+        env.events()
+            .publish((symbol_short!("batch_xf"),), (from, to, token_ids));
+
+        Ok(())
+    }
+
+    /// Approve `spender` to move up to `amount` of `token_id` on behalf of
+    /// `owner`, until ledger `expiration_ledger` (inclusive) has passed.
+    ///
+    /// A non-zero `amount` must not be given an already-expired
+    /// `expiration_ledger`, otherwise the approval would be dead on arrival.
+    /// Approving zero clears the allowance outright, so any expiration is
+    /// accepted in that case.
+    pub fn approve(
+        env: Env,
+        owner: Address,
+        spender: Address,
+        token_id: u64,
+        amount: i128,
+        expiration_ledger: u32,
+    ) {
         owner.require_auth();
         assert!(amount >= 0, "amount must be non-negative");
-        env.storage().persistent().set(&DataKey::Allowance(owner.clone(), spender.clone()), &amount);
-        env.events().publish((symbol_short!("approve"), owner, spender), amount);
+
+        let key = DataKey::Allowance(token_id, owner.clone(), spender.clone());
+
+        if amount == 0 {
+            // Clearing an allowance: drop the record entirely rather than
+            // storing a zero, so it stops accruing storage rental.
+            env.storage().persistent().remove(&key);
+        } else {
+            assert!(
+                expiration_ledger >= env.ledger().sequence(),
+                "expiration ledger is in the past"
+            );
+            env.storage().persistent().set(
+                &key,
+                &AllowanceValue {
+                    amount,
+                    expiration_ledger,
+                },
+            );
+        }
+
+        // Topic: event name + token_id (u64 scalar);
+        // owner + spender + amount + expiration_ledger in data.
+        env.events().publish(
+            (symbol_short!("approve"), token_id),
+            (owner, spender, amount, expiration_ledger),
+        );
     }
 
-    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
-        Self::ensure_not_paused(&env);
+    pub fn set_approval_for_all(env: Env, owner: Address, operator: Address, approved: bool) {
+        owner.require_auth();
+        if approved {
+            env.storage().persistent().set(
+                &DataKey::OperatorApproval(owner.clone(), operator.clone()),
+                &true,
+            );
+        } else {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::OperatorApproval(owner.clone(), operator.clone()));
+        }
+        // Topic: event name only; owner + operator + approved in data.
+        env.events()
+            .publish((symbol_short!("app_all"),), (owner, operator, approved));
+    }
+
+    /// Gasless approval using Soroban's signed auth entries.
+    ///
+    /// The owner signs this payload off-chain and a relayer can submit it on-chain.
+    /// Replay protection is enforced via nonce and expiry via deadline timestamp.
+    pub fn permit(
+        env: Env,
+        owner: Address,
+        spender: Address,
+        token_id: u64,
+        amount: i128,
+        nonce: u64,
+        deadline: u64,
+        expiration_ledger: u32,
+    ) {
+        assert!(amount >= 0, "amount must be non-negative");
+        assert!(env.ledger().timestamp() <= deadline, "permit expired");
+        assert!(
+            expiration_ledger >= env.ledger().sequence(),
+            "expiration ledger is in the past"
+        );
+
+        let current_nonce =
+            Self::permit_nonce(env.clone(), owner.clone(), spender.clone(), token_id);
+        assert!(nonce == current_nonce, "invalid nonce");
+
+        // expiration_ledger is part of the signed payload so a relayer cannot
+        // extend the lifetime of an approval the owner agreed to.
+        owner.require_auth_for_args(
+            (
+                symbol_short!("permit"),
+                spender.clone(),
+                token_id,
+                amount,
+                nonce,
+                deadline,
+                expiration_ledger,
+            )
+                .into_val(&env),
+        );
+
+        env.storage().persistent().set(
+            &DataKey::Allowance(token_id, owner.clone(), spender.clone()),
+            &AllowanceValue {
+                amount,
+                expiration_ledger,
+            },
+        );
+        env.storage().persistent().set(
+            &DataKey::PermitNonce(token_id, owner.clone(), spender.clone()),
+            &(current_nonce + 1),
+        );
+
+        env.events().publish(
+            (symbol_short!("permit"), owner, spender, token_id),
+            (amount, nonce),
+        );
+    }
+
+    pub fn transfer_from(
+        env: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        token_id: u64,
+        amount: i128,
+    ) {
         spender.require_auth();
-        assert!(amount > 0, "amount must be positive");
-        let allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
-        assert!(allowance >= amount, "insufficient allowance");
-        env.storage().persistent().set(&DataKey::Allowance(from.clone(), spender.clone()), &(allowance - amount));
-        let from_bal = Self::balance_of(env.clone(), from.clone());
-        assert!(from_bal >= amount, "insufficient balance");
-        env.storage().persistent().set(&DataKey::Balance(from.clone()), &(from_bal - amount));
-        let to_bal = Self::balance_of(env.clone(), to.clone());
-        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(to_bal + amount));
-        env.events().publish((symbol_short!("xfer_from"), from, to), amount);
+
+        // Check if operator approval exists first
+        let is_operator = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::OperatorApproval(from.clone(), spender.clone()))
+            .unwrap_or(false);
+
+        if !is_operator {
+            let key = DataKey::Allowance(token_id, from.clone(), spender.clone());
+
+            // Reading through the expiry-aware helper purges a lapsed record,
+            // so an expired allowance can never be spent and stops paying
+            // storage rental the first time anyone touches it.
+            let entry = Self::load_live_allowance(&env, &key);
+            let allowance = entry.as_ref().map(|a| a.amount).unwrap_or(0);
+            assert!(allowance >= amount, "insufficient allowance");
+
+            let remaining = allowance - amount;
+            if remaining == 0 {
+                env.storage().persistent().remove(&key);
+            } else {
+                let expiration_ledger = entry
+                    .map(|a| a.expiration_ledger)
+                    .expect("live allowance must exist");
+                env.storage().persistent().set(
+                    &key,
+                    &AllowanceValue {
+                        amount: remaining,
+                        expiration_ledger,
+                    },
+                );
+            }
+        }
+
+        Self::do_transfer(&env, from, to, token_id, amount);
+        // Topic: event name + token_id (u64 scalar); spender + amount in data.
+        env.events()
+            .publish((symbol_short!("xfer_from"), token_id), (spender, amount));
     }
 
-    pub fn burn(env: Env, from: Address, amount: i128) {
-        Self::ensure_not_paused(&env);
+    pub fn burn(env: Env, from: Address, token_id: u64, amount: i128) {
         from.require_auth();
         assert!(amount > 0, "amount must be positive");
-        let bal = Self::balance_of(env.clone(), from.clone());
+        let bal = Self::balance_of(env.clone(), from.clone(), token_id);
         assert!(bal >= amount, "insufficient balance");
-        env.storage().persistent().set(&DataKey::Balance(from.clone()), &(bal - amount));
-        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalSupply, &(supply - amount));
-        env.events().publish((symbol_short!("burn"), from), amount);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(token_id, from.clone()), &(bal - amount));
+        let supply: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalSupply(token_id))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalSupply(token_id), &(supply - amount));
+
+        // Topic: event name + token_id (u64 scalar); from + amount in data.
+        env.events()
+            .publish((symbol_short!("burn"), token_id), (from, amount));
     }
 
-    pub fn balance_of(env: Env, id: Address) -> i128 {
-        env.storage().persistent().get(&DataKey::Balance(id)).unwrap_or(0)
+    pub fn set_token_metadata(env: Env, token_id: u64, uri: String) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin not set");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenMetadata(token_id), &uri);
+        env.events()
+            .publish((symbol_short!("meta_set"), token_id), uri);
     }
 
-    pub fn allowance(env: Env, owner: Address, spender: Address) -> i128 {
-        env.storage().persistent().get(&DataKey::Allowance(owner, spender)).unwrap_or(0)
+    pub fn get_token_metadata(env: Env, token_id: u64) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenMetadata(token_id))
+            .unwrap_or(String::from_str(&env, ""))
     }
 
-    pub fn total_supply(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0)
+    pub fn balance_of(env: Env, owner: Address, token_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Balance(token_id, owner))
+            .unwrap_or(0)
+    }
+
+    /// Spendable allowance for `spender`, or 0 once it has expired.
+    pub fn allowance(env: Env, owner: Address, spender: Address, token_id: u64) -> i128 {
+        let key = DataKey::Allowance(token_id, owner, spender);
+        Self::live_allowance(&env, &key)
+            .map(|a| a.amount)
+            .unwrap_or(0)
+    }
+
+    /// Purge an expired allowance record, reclaiming its storage rental.
+    ///
+    /// Permissionless: it can only ever delete an allowance that has already
+    /// lapsed and is therefore unspendable. Returns true when a record was
+    /// removed.
+    ///
+    /// This exists as its own entry point because the purge performed on the
+    /// `transfer_from` path only survives if that call succeeds; a spend
+    /// against an expired allowance panics, and Soroban rolls the whole
+    /// invocation back, taking the purge with it.
+    pub fn purge_expired_allowance(
+        env: Env,
+        owner: Address,
+        spender: Address,
+        token_id: u64,
+    ) -> bool {
+        let key = DataKey::Allowance(token_id, owner.clone(), spender.clone());
+
+        match env.storage().persistent().get::<_, AllowanceValue>(&key) {
+            Some(a) if env.ledger().sequence() > a.expiration_ledger => {
+                env.storage().persistent().remove(&key);
+                // Topic: event name + token_id (u64 scalar); owner + spender in data.
+                env.events()
+                    .publish((symbol_short!("app_purge"), token_id), (owner, spender));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Ledger sequence at which the allowance lapses, or 0 when there is no
+    /// live allowance.
+    pub fn allowance_expiration(env: Env, owner: Address, spender: Address, token_id: u64) -> u32 {
+        let key = DataKey::Allowance(token_id, owner, spender);
+        Self::live_allowance(&env, &key)
+            .map(|a| a.expiration_ledger)
+            .unwrap_or(0)
+    }
+
+    pub fn permit_nonce(env: Env, owner: Address, spender: Address, token_id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PermitNonce(token_id, owner, spender))
+            .unwrap_or(0)
+    }
+
+    pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OperatorApproval(owner, operator))
+            .unwrap_or(false)
+    }
+
+    pub fn total_supply(env: Env, token_id: u64) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalSupply(token_id))
+            .unwrap_or(0)
     }
 
     pub fn decimals(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::Decimals).unwrap_or(7)
+        env.storage()
+            .instance()
+            .get(&DataKey::Decimals)
+            .unwrap_or(7)
     }
 
     pub fn name(env: Env) -> String {
@@ -121,20 +435,117 @@ impl TokenContract {
         env.storage().instance().get(&DataKey::Symbol).unwrap()
     }
 
-    fn ensure_not_paused(env: &Env) {
-        if let Some(registry_addr) = env.storage().instance().get::<_, Address>(&DataKey::Registry) {
-            let is_paused: bool = env.invoke_contract(&registry_addr, &soroban_sdk::symbol_short!("is_paused"), ().into_val(env));
-            if is_paused {
-                panic!("system is paused");
+    pub fn get_past_balance(env: Env, owner: Address, token_id: u64, ledger: u32) -> i128 {
+        let last_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserLastLedger(token_id, owner.clone()))
+            .unwrap_or(0);
+        if ledger >= last_ledger {
+            return Self::balance_of(env.clone(), owner, token_id);
+        }
+        env.storage()
+            .persistent()
+            .get(&DataKey::BalanceSnapshot(token_id, owner, ledger))
+            .unwrap_or(0)
+    }
+
+    /// Read an allowance, treating an expired record as absent.
+    ///
+    /// Read-only: safe to call from view functions, which must not write.
+    fn live_allowance(env: &Env, key: &DataKey) -> Option<AllowanceValue> {
+        env.storage()
+            .persistent()
+            .get::<_, AllowanceValue>(key)
+            .filter(|a| env.ledger().sequence() <= a.expiration_ledger)
+    }
+
+    /// Read an allowance and purge the record if it has expired.
+    ///
+    /// Used on the mutating path so expired approvals are reclaimed from
+    /// storage instead of paying rent indefinitely.
+    fn load_live_allowance(env: &Env, key: &DataKey) -> Option<AllowanceValue> {
+        match env.storage().persistent().get::<_, AllowanceValue>(key) {
+            Some(a) if env.ledger().sequence() <= a.expiration_ledger => Some(a),
+            Some(_) => {
+                env.storage().persistent().remove(key);
+                None
             }
+            None => None,
+        }
+    }
+
+    fn do_transfer(env: &Env, from: Address, to: Address, token_id: u64, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
+        let from_bal = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::Balance(token_id, from.clone()))
+            .unwrap_or(0);
+        assert!(from_bal >= amount, "insufficient balance");
+
+        let current_ledger = env.ledger().sequence();
+        Self::_write_checkpoint(env, from.clone(), token_id, current_ledger, from_bal);
+
+        env.storage().persistent().set(
+            &DataKey::Balance(token_id, from.clone()),
+            &from_bal.checked_sub(amount).expect("balance underflow"),
+        );
+        let to_bal = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&DataKey::Balance(token_id, to.clone()))
+            .unwrap_or(0);
+
+        Self::_write_checkpoint(env, to.clone(), token_id, current_ledger, to_bal);
+
+        env.storage().persistent().set(
+            &DataKey::Balance(token_id, to.clone()),
+            &to_bal.checked_add(amount).expect("balance overflow"),
+        );
+
+        // Topic: event name + token_id (u64 scalar); from + to + amount in data.
+        env.events()
+            .publish((symbol_short!("transfer"), token_id), (from, to, amount));
+    }
+
+    fn _write_checkpoint(
+        env: &Env,
+        user: Address,
+        token_id: u64,
+        current_ledger: u32,
+        current_balance: i128,
+    ) {
+        let last_ledger: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserLastLedger(token_id, user.clone()))
+            .unwrap_or(0);
+        if last_ledger != current_ledger {
+            env.storage().persistent().set(
+                &DataKey::BalanceSnapshot(token_id, user.clone(), last_ledger),
+                &current_balance,
+            );
+            env.storage().persistent().set(
+                &DataKey::UserLastLedger(token_id, user.clone()),
+                &current_ledger,
+            );
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env, String};
+
+    /// Expiration far beyond any ledger a test advances to, for cases whose
+    /// subject is not allowance expiry.
+    const FAR_FUTURE_LEDGER: u32 = u32::MAX;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env, String,
+    };
 
     fn setup() -> (Env, TokenContractClient<'static>, Address) {
         let env = Env::default();
@@ -157,23 +568,71 @@ mod tests {
         assert_eq!(client.decimals(), 7);
         assert_eq!(client.name(), String::from_str(&env, "AnchorToken"));
         assert_eq!(client.symbol(), String::from_str(&env, "ANCT"));
-        assert_eq!(client.total_supply(), 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "already initialized")]
-    fn test_double_initialize_panics() {
-        let (env, client, admin) = setup();
-        client.initialize(&admin, &7, &String::from_str(&env, "X"), &String::from_str(&env, "X"));
+        assert_eq!(client.total_supply(&1), 0);
     }
 
     #[test]
     fn test_mint() {
         let (env, client, _) = setup();
         let user = Address::generate(&env);
-        client.mint(&user, &1000);
-        assert_eq!(client.balance_of(&user), 1000);
-        assert_eq!(client.total_supply(), 1000);
+        let token_id = 1u64;
+        client.mint(&user, &token_id, &1000);
+        assert_eq!(client.balance_of(&user, &token_id), 1000);
+        assert_eq!(client.total_supply(&token_id), 1000);
+    }
+
+    #[test]
+    fn test_batch_transfer() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        client.mint(&alice, &2, &500);
+
+        let mut ids = soroban_sdk::Vec::new(&env);
+        ids.push_back(1);
+        ids.push_back(2);
+
+        let mut amounts = soroban_sdk::Vec::new(&env);
+        amounts.push_back(300);
+        amounts.push_back(200);
+
+        client.batch_transfer(&alice, &bob, &ids, &amounts);
+
+        assert_eq!(client.balance_of(&alice, &1), 700);
+        assert_eq!(client.balance_of(&bob, &1), 300);
+        assert_eq!(client.balance_of(&alice, &2), 300);
+        assert_eq!(client.balance_of(&bob, &2), 200);
+    }
+
+    #[test]
+    fn test_metadata() {
+        let (env, client, _admin) = setup();
+        let token_id = 1u64;
+        let uri = String::from_str(&env, "ipfs://test");
+
+        client.set_token_metadata(&token_id, &uri);
+        assert_eq!(client.get_token_metadata(&token_id), uri);
+    }
+
+    #[test]
+    fn test_operator_approval() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let operator = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        // Not approved before the operator approval is set
+        assert!(!client.is_approved_for_all(&alice, &operator));
+        assert!(!client.is_approved_for_all(&operator, &alice));
+        client.set_approval_for_all(&alice, &operator, &true);
+
+        assert!(client.is_approved_for_all(&alice, &operator));
+
+        client.transfer_from(&operator, &alice, &bob, &1, &300);
+        assert_eq!(client.balance_of(&bob, &1), 300);
     }
 
     #[test]
@@ -181,7 +640,7 @@ mod tests {
     fn test_mint_zero_panics() {
         let (env, client, _) = setup();
         let user = Address::generate(&env);
-        client.mint(&user, &0);
+        client.mint(&user, &1, &0);
     }
 
     #[test]
@@ -189,66 +648,490 @@ mod tests {
         let (env, client, _) = setup();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
-        client.mint(&alice, &500);
-        client.transfer(&alice, &bob, &200);
-        assert_eq!(client.balance_of(&alice), 300);
-        assert_eq!(client.balance_of(&bob), 200);
-    }
-
-    #[test]
-    #[should_panic(expected = "insufficient balance")]
-    fn test_transfer_insufficient_balance() {
-        let (env, client, _) = setup();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        client.mint(&alice, &100);
-        client.transfer(&alice, &bob, &200);
-    }
-
-    #[test]
-    fn test_approve_and_transfer_from() {
-        let (env, client, _) = setup();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        let carol = Address::generate(&env);
-        client.mint(&alice, &1000);
-        client.approve(&alice, &bob, &300);
-        assert_eq!(client.allowance(&alice, &bob), 300);
-        client.transfer_from(&bob, &alice, &carol, &200);
-        assert_eq!(client.balance_of(&alice), 800);
-        assert_eq!(client.balance_of(&carol), 200);
-        assert_eq!(client.allowance(&alice, &bob), 100);
-    }
-
-    #[test]
-    #[should_panic(expected = "insufficient allowance")]
-    fn test_transfer_from_exceeds_allowance() {
-        let (env, client, _) = setup();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        let carol = Address::generate(&env);
-        client.mint(&alice, &1000);
-        client.approve(&alice, &bob, &50);
-        client.transfer_from(&bob, &alice, &carol, &100);
+        let token_id = 1u64;
+        client.mint(&alice, &token_id, &500);
+        client.transfer(&alice, &bob, &token_id, &200);
+        assert_eq!(client.balance_of(&alice, &token_id), 300);
+        assert_eq!(client.balance_of(&bob, &token_id), 200);
     }
 
     #[test]
     fn test_burn() {
         let (env, client, _) = setup();
         let alice = Address::generate(&env);
-        client.mint(&alice, &500);
-        client.burn(&alice, &200);
-        assert_eq!(client.balance_of(&alice), 300);
-        assert_eq!(client.total_supply(), 300);
+        let token_id = 1u64;
+        client.mint(&alice, &token_id, &500);
+        client.burn(&alice, &token_id, &200);
+        assert_eq!(client.balance_of(&alice, &token_id), 300);
+        assert_eq!(client.total_supply(&token_id), 300);
     }
 
     #[test]
-    #[should_panic(expected = "insufficient balance")]
-    fn test_burn_exceeds_balance() {
+    fn test_permit_sets_allowance_and_increments_nonce() {
+        let (env, client, _) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let token_id = 1u64;
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+
+        assert_eq!(client.permit_nonce(&owner, &spender, &token_id), 0);
+        client.permit(
+            &owner,
+            &spender,
+            &token_id,
+            &700,
+            &0,
+            &200,
+            &FAR_FUTURE_LEDGER,
+        );
+        assert_eq!(client.allowance(&owner, &spender, &token_id), 700);
+        assert_eq!(client.permit_nonce(&owner, &spender, &token_id), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "permit expired")]
+    fn test_permit_expired_panics() {
+        let (env, client, _) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let token_id = 1u64;
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+        client.permit(
+            &owner,
+            &spender,
+            &token_id,
+            &100,
+            &0,
+            &99,
+            &FAR_FUTURE_LEDGER,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid nonce")]
+    fn test_permit_replay_panics() {
+        let (env, client, _) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let token_id = 1u64;
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+        client.permit(
+            &owner,
+            &spender,
+            &token_id,
+            &100,
+            &0,
+            &200,
+            &FAR_FUTURE_LEDGER,
+        );
+        client.permit(
+            &owner,
+            &spender,
+            &token_id,
+            &100,
+            &0,
+            &200,
+            &FAR_FUTURE_LEDGER,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_batch_transfer_length_mismatch() {
         let (env, client, _) = setup();
         let alice = Address::generate(&env);
-        client.mint(&alice, &100);
-        client.burn(&alice, &200);
+        let bob = Address::generate(&env);
+        let ids = soroban_sdk::Vec::from_array(&env, [1, 2]);
+        let amounts = soroban_sdk::Vec::from_array(&env, [100i128]);
+        client.batch_transfer(&alice, &bob, &ids, &amounts);
+    }
+
+    #[test]
+    fn test_batch_transfer_returns_error_on_length_mismatch() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let ids = soroban_sdk::Vec::from_array(&env, [1u64, 2u64]);
+        let amounts = soroban_sdk::Vec::from_array(&env, [100i128]);
+        // try_batch_transfer returns the Result directly without panicking
+        let result = client.try_batch_transfer(&alice, &bob, &ids, &amounts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_transfer_max_size_enforced() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // Build a batch with exactly MAX_BATCH_SIZE (100) entries — should succeed
+        let mut ids = soroban_sdk::Vec::new(&env);
+        let mut amounts = soroban_sdk::Vec::new(&env);
+        for i in 1u64..=100 {
+            client.mint(&alice, &i, &1000);
+            ids.push_back(i);
+            amounts.push_back(1i128);
+        }
+        client.batch_transfer(&alice, &bob, &ids, &amounts);
+        assert_eq!(client.balance_of(&bob, &1), 1);
+        assert_eq!(client.balance_of(&bob, &100), 1);
+    }
+
+    #[test]
+    fn test_batch_transfer_exceeds_max_size_returns_error() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // Build a batch with 101 entries — should fail with BatchTooLarge
+        let mut ids = soroban_sdk::Vec::new(&env);
+        let mut amounts = soroban_sdk::Vec::new(&env);
+        for i in 1u64..=101 {
+            client.mint(&alice, &i, &1000);
+            ids.push_back(i);
+            amounts.push_back(1i128);
+        }
+        let result = client.try_batch_transfer(&alice, &bob, &ids, &amounts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn test_initialize_twice_panics() {
+        let (env, client, admin) = setup();
+        client.initialize(
+            &admin,
+            &7u32,
+            &String::from_str(&env, "AnchorToken"),
+            &String::from_str(&env, "ANCT"),
+        );
+    }
+
+    #[test]
+    fn test_operator_does_not_consume_allowance() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let operator = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        client.approve(&alice, &operator, &1, &500, &FAR_FUTURE_LEDGER);
+        client.set_approval_for_all(&alice, &operator, &true);
+
+        client.transfer_from(&operator, &alice, &bob, &1, &300);
+
+        // Allowance should still be 500 because operator bypasses it
+        assert_eq!(client.allowance(&alice, &operator, &1), 500);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient allowance")]
+    fn test_transfer_from_insufficient_allowance() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        client.approve(&alice, &spender, &1, &100, &FAR_FUTURE_LEDGER);
+        client.transfer_from(&spender, &alice, &bob, &1, &150);
+    }
+
+    // -- Allowance expiration -------------------------------------------------
+
+    /// Move the ledger sequence to `seq`.
+    fn set_sequence(env: &Env, seq: u32) {
+        env.ledger().with_mut(|l| l.sequence_number = seq);
+    }
+
+    #[test]
+    fn test_allowance_is_spendable_before_expiration() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+
+        assert_eq!(client.allowance(&alice, &spender, &1), 500);
+        assert_eq!(client.allowance_expiration(&alice, &spender, &1), 200);
+
+        set_sequence(&env, 199);
+        client.transfer_from(&spender, &alice, &bob, &1, &100);
+        assert_eq!(client.balance_of(&bob, &1), 100);
+        assert_eq!(client.allowance(&alice, &spender, &1), 400);
+    }
+
+    #[test]
+    fn test_allowance_is_spendable_on_the_expiration_ledger() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+
+        // expiration_ledger is inclusive.
+        set_sequence(&env, 200);
+        client.transfer_from(&spender, &alice, &bob, &1, &100);
+        assert_eq!(client.balance_of(&bob, &1), 100);
+    }
+
+    #[test]
+    fn test_allowance_reads_zero_after_expiration() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+        assert_eq!(client.allowance(&alice, &spender, &1), 500);
+
+        set_sequence(&env, 201);
+        assert_eq!(client.allowance(&alice, &spender, &1), 0);
+        assert_eq!(client.allowance_expiration(&alice, &spender, &1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient allowance")]
+    fn test_transfer_from_expired_allowance_panics() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+
+        set_sequence(&env, 201);
+        client.transfer_from(&spender, &alice, &bob, &1, &100);
+    }
+
+    #[test]
+    fn test_expired_allowance_is_purged_from_storage() {
+        let (env, client, _) = setup();
+        let contract_id = client.address.clone();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+
+        let key = DataKey::Allowance(1, alice.clone(), spender.clone());
+        env.as_contract(&contract_id, || {
+            assert!(env.storage().persistent().has(&key));
+        });
+
+        // Spending against an expired allowance must fail.
+        set_sequence(&env, 201);
+        assert!(client
+            .try_transfer_from(&spender, &alice, &bob, &1, &1)
+            .is_err());
+
+        // That failure reverts, so the record is reclaimed through the
+        // dedicated purge entry point instead.
+        assert!(client.purge_expired_allowance(&alice, &spender, &1));
+
+        env.as_contract(&contract_id, || {
+            assert!(
+                !env.storage().persistent().has(&key),
+                "expired allowance must be purged"
+            );
+        });
+
+        // Purging is idempotent.
+        assert!(!client.purge_expired_allowance(&alice, &spender, &1));
+    }
+
+    #[test]
+    fn test_purge_does_not_touch_a_live_allowance() {
+        let (env, client, _) = setup();
+        let contract_id = client.address.clone();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+
+        // Still live: the permissionless purge must be a no-op.
+        set_sequence(&env, 150);
+        assert!(!client.purge_expired_allowance(&alice, &spender, &1));
+
+        let key = DataKey::Allowance(1, alice.clone(), spender.clone());
+        env.as_contract(&contract_id, || {
+            assert!(env.storage().persistent().has(&key));
+        });
+        assert_eq!(client.allowance(&alice, &spender, &1), 500);
+    }
+
+    #[test]
+    fn test_fully_spent_allowance_is_purged_from_storage() {
+        let (env, client, _) = setup();
+        let contract_id = client.address.clone();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+        client.transfer_from(&spender, &alice, &bob, &1, &500);
+
+        let key = DataKey::Allowance(1, alice.clone(), spender.clone());
+        env.as_contract(&contract_id, || {
+            assert!(
+                !env.storage().persistent().has(&key),
+                "exhausted allowance must be purged"
+            );
+        });
+        assert_eq!(client.allowance(&alice, &spender, &1), 0);
+    }
+
+    #[test]
+    fn test_approve_zero_clears_allowance_and_storage() {
+        let (env, client, _) = setup();
+        let contract_id = client.address.clone();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+        client.approve(&alice, &spender, &1, &0, &200);
+
+        assert_eq!(client.allowance(&alice, &spender, &1), 0);
+        let key = DataKey::Allowance(1, alice.clone(), spender.clone());
+        env.as_contract(&contract_id, || {
+            assert!(!env.storage().persistent().has(&key));
+        });
+    }
+
+    #[test]
+    fn test_approve_zero_accepts_past_expiration() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+
+        // Revoking must never be blocked by a stale expiration argument.
+        client.approve(&alice, &spender, &1, &0, &1);
+        assert_eq!(client.allowance(&alice, &spender, &1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expiration ledger is in the past")]
+    fn test_approve_with_past_expiration_panics() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &99);
+    }
+
+    #[test]
+    fn test_reapprove_extends_expiration() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &150);
+
+        // Renew before lapsing.
+        set_sequence(&env, 140);
+        client.approve(&alice, &spender, &1, &500, &300);
+        assert_eq!(client.allowance_expiration(&alice, &spender, &1), 300);
+
+        set_sequence(&env, 250);
+        client.transfer_from(&spender, &alice, &bob, &1, &500);
+        assert_eq!(client.balance_of(&bob, &1), 500);
+    }
+
+    #[test]
+    fn test_partial_spend_preserves_expiration() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let spender = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        set_sequence(&env, 100);
+        client.approve(&alice, &spender, &1, &500, &200);
+
+        client.transfer_from(&spender, &alice, &bob, &1, &200);
+
+        // Spending part of an allowance must not silently extend or reset it.
+        assert_eq!(client.allowance(&alice, &spender, &1), 300);
+        assert_eq!(client.allowance_expiration(&alice, &spender, &1), 200);
+    }
+
+    #[test]
+    fn test_operator_approval_ignores_allowance_expiration() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let operator = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.mint(&alice, &1, &1000);
+        set_sequence(&env, 100);
+        client.approve(&alice, &operator, &1, &10, &150);
+        client.set_approval_for_all(&alice, &operator, &true);
+
+        // Operator authority is independent of the per-token allowance, so an
+        // expired allowance must not block it.
+        set_sequence(&env, 300);
+        client.transfer_from(&operator, &alice, &bob, &1, &900);
+        assert_eq!(client.balance_of(&bob, &1), 900);
+    }
+
+    #[test]
+    fn test_permit_respects_expiration_ledger() {
+        let (env, client, _) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        set_sequence(&env, 100);
+        client.permit(&owner, &spender, &1, &700, &0, &200, &250);
+        assert_eq!(client.allowance(&owner, &spender, &1), 700);
+        assert_eq!(client.allowance_expiration(&owner, &spender, &1), 250);
+
+        set_sequence(&env, 251);
+        assert_eq!(client.allowance(&owner, &spender, &1), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "expiration ledger is in the past")]
+    fn test_permit_with_past_expiration_panics() {
+        let (env, client, _) = setup();
+        let owner = Address::generate(&env);
+        let spender = Address::generate(&env);
+
+        set_sequence(&env, 100);
+        client.permit(&owner, &spender, &1, &700, &0, &200, &99);
+    }
+
+    #[test]
+    fn test_set_metadata_authorized() {
+        let (env, client, _admin) = setup();
+        let token_id = 1u64;
+        let uri = String::from_str(&env, "ipfs://test");
+
+        client.set_token_metadata(&token_id, &uri);
+        assert_eq!(client.get_token_metadata(&token_id), uri);
     }
 }
 
@@ -260,8 +1143,13 @@ mod tests {
 /// patterns to ensure mathematical correctness.
 #[cfg(test)]
 mod invariants {
+    extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env, String};
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Env, String};
+
+    /// Expiration far beyond any ledger a test advances to, for cases whose
+    /// subject is not allowance expiry.
+    const FAR_FUTURE_LEDGER: u32 = u32::MAX;
 
     /// Helper to set up a fresh contract instance
     fn setup_fresh() -> (Env, TokenContractClient<'static>, Address) {
@@ -290,19 +1178,20 @@ mod invariants {
         let user1 = Address::generate(&env);
         let user2 = Address::generate(&env);
         let user3 = Address::generate(&env);
+        let token_id = 1u64;
 
         // Mint to multiple users
-        client.mint(&user1, &1000);
-        client.mint(&user2, &500);
-        client.mint(&user3, &250);
+        client.mint(&user1, &token_id, &1000);
+        client.mint(&user2, &token_id, &500);
+        client.mint(&user3, &token_id, &250);
 
-        let balance_sum = client.balance_of(&user1)
-            + client.balance_of(&user2)
-            + client.balance_of(&user3);
-        
+        let balance_sum = client.balance_of(&user1, &token_id)
+            + client.balance_of(&user2, &token_id)
+            + client.balance_of(&user3, &token_id);
+
         // Invariant: sum of balances equals total supply
         assert_eq!(
-            client.total_supply(),
+            client.total_supply(&token_id),
             balance_sum,
             "INVARIANT VIOLATION: Supply conservation failed after mint"
         );
@@ -314,389 +1203,531 @@ mod invariants {
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
         let carol = Address::generate(&env);
+        let token_id = 1u64;
 
-        client.mint(&alice, &1000);
+        client.mint(&alice, &token_id, &1000);
 
-        let supply_before = client.total_supply();
-        
+        let supply_before = client.total_supply(&token_id);
+
         // Multiple transfers
-        client.transfer(&alice, &bob, &300);
-        client.transfer(&bob, &carol, &150);
-        client.transfer(&alice, &carol, &100);
+        client.transfer(&alice, &bob, &token_id, &300);
+        client.transfer(&bob, &carol, &token_id, &150);
+        client.transfer(&alice, &carol, &token_id, &100);
 
-        let supply_after = client.total_supply();
-        
+        let supply_after = client.total_supply(&token_id);
+
         // Invariant: transfers do not change total supply
         assert_eq!(
-            supply_before,
-            supply_after,
+            supply_before, supply_after,
             "INVARIANT VIOLATION: Supply changed during transfers"
         );
 
         // Invariant: sum of balances still equals supply
-        let balance_sum = client.balance_of(&alice)
-            + client.balance_of(&bob)
-            + client.balance_of(&carol);
+        let balance_sum = client.balance_of(&alice, &token_id)
+            + client.balance_of(&bob, &token_id)
+            + client.balance_of(&carol, &token_id);
         assert_eq!(
-            supply_after,
-            balance_sum,
+            supply_after, balance_sum,
             "INVARIANT VIOLATION: Balance sum doesn't match supply after transfers"
         );
     }
 
+    // ============================================================================
+    // Balance history (get_past_balance / checkpoints)
+    // ============================================================================
+
     #[test]
-    fn invariant_supply_conservation_after_burn() {
-        let (env, client, _) = setup_fresh();
-        let user = Address::generate(&env);
+    fn test_get_past_balance_no_transfer_history() {
+        let (env, client, _) = setup();
+        let alice = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let token_id = 1u64;
 
-        client.mint(&user, &1000);
-        let supply_before_burn = client.total_supply();
-        
-        client.burn(&user, &300);
-        
-        // Invariant: supply decreases by exactly the burned amount
-        assert_eq!(
-            client.total_supply(),
-            supply_before_burn - 300,
-            "INVARIANT VIOLATION: Supply not reduced correctly after burn"
-        );
+        client.mint(&alice, &token_id, &1000);
 
-        // Invariant: balance equals remaining supply
-        assert_eq!(
-            client.balance_of(&user),
-            client.total_supply(),
-            "INVARIANT VIOLATION: Balance doesn't match supply after burn"
-        );
+        // No checkpoints exist yet (last ledger defaults to 0), so the query
+        // falls back to the current balance.
+        assert_eq!(client.get_past_balance(&alice, &token_id, &50), 1000);
+        // A user with no balance at all returns 0.
+        assert_eq!(client.get_past_balance(&stranger, &token_id, &50), 0);
     }
 
-    // =========================================================================
-    // INVARIANT 2: Non-Negative Balances
-    // =========================================================================
-    /// All balances must always be non-negative (>= 0).
-    /// This is enforced by the contract logic, but we verify it holds.
     #[test]
-    fn invariant_non_negative_balances() {
-        let (env, client, _) = setup_fresh();
-        let user = Address::generate(&env);
-
-        // Initial balance is 0 (non-negative)
-        assert!(
-            client.balance_of(&user) >= 0,
-            "INVARIANT VIOLATION: Initial balance is negative"
-        );
-
-        client.mint(&user, &100);
-        assert!(
-            client.balance_of(&user) >= 0,
-            "INVARIANT VIOLATION: Balance negative after mint"
-        );
-
-        client.burn(&user, &100);
-        assert!(
-            client.balance_of(&user) >= 0,
-            "INVARIANT VIOLATION: Balance negative after burn"
-        );
-    }
-
-    // =========================================================================
-    // INVARIANT 3: Conservation of Value in Transfer
-    // =========================================================================
-    /// In any transfer, the sum of sender and receiver balances before
-    /// must equal the sum after the transfer.
-    #[test]
-    fn invariant_transfer_value_conservation() {
-        let (env, client, _) = setup_fresh();
+    fn test_get_past_balance_snapshots() {
+        let (env, client, _) = setup();
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
+        let token_id = 1u64;
 
-        client.mint(&alice, &1000);
+        client.mint(&alice, &token_id, &1000);
 
-        let alice_before = client.balance_of(&alice);
-        let bob_before = client.balance_of(&bob);
-        let sum_before = alice_before + bob_before;
+        // First transfer at ledger 100 checkpoints alice's pre-transfer balance
+        // (1000) at ledger 0; her balance becomes 700.
+        env.ledger().set_sequence_number(100);
+        client.transfer(&alice, &bob, &token_id, &300);
 
-        client.transfer(&alice, &bob, &400);
+        // Second transfer at ledger 200 checkpoints alice's pre-transfer balance
+        // (700) at ledger 100; her balance becomes 500. Bob's pre-transfer
+        // balance (0) is checkpointed at ledger 0.
+        env.ledger().set_sequence_number(200);
+        client.transfer(&alice, &bob, &token_id, &200);
 
-        let alice_after = client.balance_of(&alice);
-        let bob_after = client.balance_of(&bob);
-        let sum_after = alice_after + bob_after;
+        // Ledger at/after the last checkpoint -> current balance
+        assert_eq!(client.get_past_balance(&alice, &token_id, &200), 500);
+        assert_eq!(client.get_past_balance(&alice, &token_id, &500), 500);
 
-        // Invariant: total value is conserved
-        assert_eq!(
-            sum_before,
-            sum_after,
-            "INVARIANT VIOLATION: Value not conserved in transfer"
-        );
+        // Ledger before the last checkpoint -> snapshot recorded at that ledger
+        assert_eq!(client.get_past_balance(&alice, &token_id, &100), 700);
+        assert_eq!(client.get_past_balance(&alice, &token_id, &0), 1000);
 
-        // Additional checks: exact changes
-        assert_eq!(
-            alice_before - alice_after,
-            400,
-            "INVARIANT VIOLATION: Sender balance not reduced correctly"
-        );
-        assert_eq!(
-            bob_after - bob_before,
-            400,
-            "INVARIANT VIOLATION: Receiver balance not increased correctly"
-        );
+        // Bob's pre-transfer balance (300) was checkpointed at ledger 100
+        assert_eq!(client.get_past_balance(&bob, &token_id, &100), 300);
+        // Ledger before any snapshot -> 0
+        assert_eq!(client.get_past_balance(&bob, &token_id, &50), 0);
     }
 
-    // =========================================================================
-    // INVARIANT 4: Allowance Accounting
-    // =========================================================================
-    /// After transfer_from, the allowance must decrease by exactly the
-    /// transferred amount.
-    #[test]
-    fn invariant_allowance_decrease_on_transfer_from() {
-        let (env, client, _) = setup_fresh();
-        let owner = Address::generate(&env);
-        let spender = Address::generate(&env);
-        let recipient = Address::generate(&env);
+    /// ============================================================================
+    /// Formal Verification Invariants
+    /// ============================================================================
+    /// These tests verify critical invariants that must hold for all valid states
+    /// and operations of the token contract. They use property-based testing
+    /// patterns to ensure mathematical correctness.
+    #[cfg(test)]
+    mod invariants {
+        extern crate std;
+        use super::*;
+        use soroban_sdk::{Env, String};
 
-        client.mint(&owner, &1000);
-        client.approve(&owner, &spender, &500);
+        /// Helper to set up a fresh contract instance
+        fn setup_fresh() -> (Env, TokenContractClient<'static>, Address) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let id = env.register(TokenContract, ());
+            let client = TokenContractClient::new(&env, &id);
+            let admin = Address::generate(&env);
+            client.initialize(
+                &admin,
+                &7u32,
+                &String::from_str(&env, "AnchorToken"),
+                &String::from_str(&env, "ANCT"),
+            );
+            (env, client, admin)
+        }
 
-        let allowance_before = client.allowance(&owner, &spender);
-        
-        client.transfer_from(&spender, &owner, &recipient, &200);
+        // =========================================================================
+        // INVARIANT 1: Conservation of Supply
+        // =========================================================================
+        /// After any operation, the sum of all user balances must equal total_supply.
+        /// This is the fundamental invariant of any token contract.
+        #[test]
+        fn invariant_supply_conservation_after_mint() {
+            let (env, client, _) = setup_fresh();
+            let user1 = Address::generate(&env);
+            let user2 = Address::generate(&env);
+            let user3 = Address::generate(&env);
+            let token_id = 1u64;
 
-        let allowance_after = client.allowance(&owner, &spender);
+            // Mint to multiple users
+            client.mint(&user1, &token_id, &1000);
+            client.mint(&user2, &token_id, &500);
+            client.mint(&user3, &token_id, &250);
 
-        // Invariant: allowance decreased by exactly the spent amount
-        assert_eq!(
-            allowance_before - allowance_after,
-            200,
-            "INVARIANT VIOLATION: Allowance not reduced correctly"
-        );
-    }
+            let balance_sum = client.balance_of(&user1, &token_id)
+                + client.balance_of(&user2, &token_id)
+                + client.balance_of(&user3, &token_id);
 
-    #[test]
-    fn invariant_allowance_cannot_exceed_approval() {
-        let (env, client, _) = setup_fresh();
-        let owner = Address::generate(&env);
-        let spender = Address::generate(&env);
-        let recipient = Address::generate(&env);
+            // Invariant: sum of balances equals total supply
+            assert_eq!(
+                client.total_supply(&token_id),
+                balance_sum,
+                "INVARIANT VIOLATION: Supply conservation failed after mint"
+            );
+        }
 
-        client.mint(&owner, &1000);
-        client.approve(&owner, &spender, &100);
+        #[test]
+        fn invariant_supply_conservation_after_transfer() {
+            let (env, client, _) = setup_fresh();
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+            let carol = Address::generate(&env);
+            let token_id = 1u64;
 
-        // Attempting to spend more than approved should fail
-        let result = std::panic::catch_unwind(|| {
-            client.transfer_from(&spender, &owner, &recipient, &150);
-        });
-        
-        assert!(
-            result.is_err(),
-            "INVARIANT VIOLATION: Spender was able to exceed allowance"
-        );
-    }
+            client.mint(&alice, &token_id, &1000);
 
-    // =========================================================================
-    // INVARIANT 5: No Double Spend
-    // =========================================================================
-    /// A user cannot spend the same tokens twice (either directly or via approval).
-    #[test]
-    fn invariant_no_double_spend_direct() {
-        let (env, client, _) = setup_fresh();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        let carol = Address::generate(&env);
+            let supply_before = client.total_supply(&token_id);
 
-        client.mint(&alice, &100);
+            // Multiple transfers
+            client.transfer(&alice, &bob, &token_id, &300);
+            client.transfer(&bob, &carol, &token_id, &150);
+            client.transfer(&alice, &carol, &token_id, &100);
 
-        // First transfer succeeds
-        client.transfer(&alice, &bob, &60);
-        
-        // Alice now has 40, trying to spend 60 more should fail
-        let result = std::panic::catch_unwind(|| {
-            client.transfer(&alice, &carol, &60);
-        });
-        
-        assert!(
-            result.is_err(),
-            "INVARIANT VIOLATION: Double spend was possible"
-        );
-        
-        // Verify final state is consistent
-        assert_eq!(client.balance_of(&alice), 40);
-        assert_eq!(client.balance_of(&bob), 60);
-        assert_eq!(client.balance_of(&carol), 0);
-    }
+            let supply_after = client.total_supply(&token_id);
 
-    // =========================================================================
-    // INVARIANT 6: Total Supply Monotonicity
-    // =========================================================================
-    /// Total supply only increases via mint and only decreases via burn.
-    /// Transfers do not affect total supply.
-    #[test]
-    fn invariant_supply_only_changes_via_mint_burn() {
-        let (env, client, _) = setup_fresh();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
+            // Invariant: transfers do not change total supply
+            assert_eq!(
+                supply_before, supply_after,
+                "INVARIANT VIOLATION: Supply changed during transfers"
+            );
 
-        let initial_supply = client.total_supply();
-        assert_eq!(initial_supply, 0);
+            // Invariant: sum of balances still equals supply
+            let balance_sum = client.balance_of(&alice, &token_id)
+                + client.balance_of(&bob, &token_id)
+                + client.balance_of(&carol, &token_id);
+            assert_eq!(
+                supply_after, balance_sum,
+                "INVARIANT VIOLATION: Balance sum doesn't match supply after transfers"
+            );
+        }
 
-        // Mint increases supply
-        client.mint(&alice, &500);
-        assert_eq!(client.total_supply(), 500);
+        #[test]
+        fn invariant_supply_conservation_after_burn() {
+            let (env, client, _) = setup_fresh();
+            let user = Address::generate(&env);
+            let token_id = 1u64;
 
-        // Transfer does not change supply
-        client.transfer(&alice, &bob, &200);
-        assert_eq!(
-            client.total_supply(),
-            500,
-            "INVARIANT VIOLATION: Transfer changed total supply"
-        );
+            client.mint(&user, &token_id, &1000);
+            let supply_before_burn = client.total_supply(&token_id);
 
-        // Approve does not change supply
-        client.approve(&alice, &bob, &100);
-        assert_eq!(
-            client.total_supply(),
-            500,
-            "INVARIANT VIOLATION: Approve changed total supply"
-        );
+            client.burn(&user, &token_id, &300);
 
-        // Burn decreases supply
-        client.burn(&alice, &100);
-        assert_eq!(client.total_supply(), 400);
-    }
+            // Invariant: supply decreases by exactly the burned amount
+            assert_eq!(
+                client.total_supply(&token_id),
+                supply_before_burn - 300,
+                "INVARIANT VIOLATION: Supply not reduced correctly after burn"
+            );
 
-    // =========================================================================
-    // INVARIANT 7: Zero Address Handling
-    // =========================================================================
-    /// The contract should handle zero amounts appropriately.
-    #[test]
-    fn invariant_zero_amount_rejected() {
-        let (env, client, _) = setup_fresh();
-        let user = Address::generate(&env);
+            // Invariant: balance equals remaining supply
+            assert_eq!(
+                client.balance_of(&user, &token_id),
+                client.total_supply(&token_id),
+                "INVARIANT VIOLATION: Balance doesn't match supply after burn"
+            );
+        }
 
-        // Mint zero should fail
-        let result = std::panic::catch_unwind(|| {
-            client.mint(&user, &0);
-        });
-        assert!(result.is_err(), "INVARIANT VIOLATION: Mint of zero accepted");
+        // =========================================================================
+        // INVARIANT 2: Non-Negative Balances
+        // =========================================================================
+        /// All balances must always be non-negative (>= 0).
+        /// This is enforced by the contract logic, but we verify it holds.
+        #[test]
+        fn invariant_non_negative_balances() {
+            let (env, client, _) = setup_fresh();
+            let user = Address::generate(&env);
+            let token_id = 1u64;
 
-        // Burn zero should fail
-        client.mint(&user, &100);
-        let result = std::panic::catch_unwind(|| {
-            client.burn(&user, &0);
-        });
-        assert!(result.is_err(), "INVARIANT VIOLATION: Burn of zero accepted");
-    }
+            // Initial balance is 0 (non-negative)
+            assert!(
+                client.balance_of(&user, &token_id) >= 0,
+                "INVARIANT VIOLATION: Initial balance is negative"
+            );
 
-    // =========================================================================
-    // INVARIANT 8: Idempotency Properties
-    // =========================================================================
-    /// Certain operations should have predictable idempotent-like behavior.
-    #[test]
-    fn invariant_approve_overwrites() {
-        let (env, client, _) = setup_fresh();
-        let owner = Address::generate(&env);
-        let spender = Address::generate(&env);
+            client.mint(&user, &token_id, &100);
+            assert!(
+                client.balance_of(&user, &token_id) >= 0,
+                "INVARIANT VIOLATION: Balance negative after mint"
+            );
 
-        client.approve(&owner, &spender, &100);
-        assert_eq!(client.allowance(&owner, &spender), 100);
+            client.burn(&user, &token_id, &100);
+            assert!(
+                client.balance_of(&user, &token_id) >= 0,
+                "INVARIANT VIOLATION: Balance negative after burn"
+            );
+        }
 
-        // New approval should overwrite, not add
-        client.approve(&owner, &spender, &200);
-        assert_eq!(
-            client.allowance(&owner, &spender),
-            200,
-            "INVARIANT VIOLATION: Approve did not overwrite previous allowance"
-        );
-    }
+        // =========================================================================
+        // INVARIANT 3: Conservation of Value in Transfer
+        // =========================================================================
+        /// In any transfer, the sum of sender and receiver balances before
+        /// must equal the sum after the transfer.
+        #[test]
+        fn invariant_transfer_value_conservation() {
+            let (env, client, _) = setup_fresh();
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+            let token_id = 1u64;
 
-    // =========================================================================
-    // PROPERTY-BASED INVARIANT TESTS
-    // =========================================================================
-    /// These tests verify invariants across sequences of random-ish operations.
-    
-    #[test]
-    fn property_sequence_invariant() {
-        let (env, client, _) = setup_fresh();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        let carol = Address::generate(&env);
+            client.mint(&alice, &token_id, &1000);
 
-        // Sequence of operations that should maintain invariants
-        client.mint(&alice, &1000);                              // Alice: 1000
-        client.mint(&bob, &500);                                 // Bob: 500
-        client.transfer(&alice, &bob, &200);                     // Alice: 800, Bob: 700
-        client.approve(&bob, &carol, &300);
-        client.transfer_from(&carol, &bob, &alice, &150);        // Alice: 950, Bob: 550
-        client.burn(&alice, &100);                               // Total supply reduced by 100
+            let alice_before = client.balance_of(&alice, &token_id);
+            let bob_before = client.balance_of(&bob, &token_id);
+            let sum_before = alice_before + bob_before;
 
-        // Verify final invariants
-        let total_balance = client.balance_of(&alice) 
-            + client.balance_of(&bob) 
-            + client.balance_of(&carol);
-        
-        assert_eq!(
-            client.total_supply(),
-            total_balance,
-            "PROPERTY VIOLATION: Supply invariant broken after operation sequence"
-        );
+            client.transfer(&alice, &bob, &token_id, &400);
 
-        assert!(
-            client.balance_of(&alice) >= 0
-                && client.balance_of(&bob) >= 0
-                && client.balance_of(&carol) >= 0,
-            "PROPERTY VIOLATION: Negative balance detected"
-        );
-    }
+            let alice_after = client.balance_of(&alice, &token_id);
+            let bob_after = client.balance_of(&bob, &token_id);
+            let sum_after = alice_after + bob_after;
 
-    #[test]
-    fn property_mint_burn_symmetry() {
-        let (env, client, _) = setup_fresh();
-        let user = Address::generate(&env);
+            // Invariant: total value is conserved
+            assert_eq!(
+                sum_before, sum_after,
+                "INVARIANT VIOLATION: Value not conserved in transfer"
+            );
 
-        // Mint then burn same amount should return to initial state
-        let initial_supply = client.total_supply();
-        let initial_balance = client.balance_of(&user);
+            // Additional checks: exact changes
+            assert_eq!(
+                alice_before - alice_after,
+                400,
+                "INVARIANT VIOLATION: Sender balance not reduced correctly"
+            );
+            assert_eq!(
+                bob_after - bob_before,
+                400,
+                "INVARIANT VIOLATION: Receiver balance not increased correctly"
+            );
+        }
 
-        client.mint(&user, &500);
-        client.burn(&user, &500);
+        // =========================================================================
+        // INVARIANT 4: Allowance Accounting
+        // =========================================================================
+        /// After transfer_from, the allowance must decrease by exactly the
+        /// transferred amount.
+        #[test]
+        fn invariant_allowance_decrease_on_transfer_from() {
+            let (env, client, _) = setup_fresh();
+            let owner = Address::generate(&env);
+            let spender = Address::generate(&env);
+            let recipient = Address::generate(&env);
+            let token_id = 1u64;
 
-        assert_eq!(
-            client.total_supply(),
-            initial_supply,
-            "PROPERTY VIOLATION: Mint-burn symmetry broken for supply"
-        );
-        assert_eq!(
-            client.balance_of(&user),
-            initial_balance,
-            "PROPERTY VIOLATION: Mint-burn symmetry broken for balance"
-        );
-    }
+            client.mint(&owner, &token_id, &1000);
+            client.approve(&owner, &spender, &token_id, &500, &FAR_FUTURE_LEDGER);
 
-    #[test]
-    fn property_transfer_reversibility_check() {
-        let (env, client, _) = setup_fresh();
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
+            let allowance_before = client.allowance(&owner, &spender, &token_id);
 
-        client.mint(&alice, &1000);
+            client.transfer_from(&spender, &owner, &recipient, &token_id, &200);
 
-        let alice_initial = client.balance_of(&alice);
-        let bob_initial = client.balance_of(&bob);
+            let allowance_after = client.allowance(&owner, &spender, &token_id);
 
-        // Transfer A -> B
-        client.transfer(&alice, &bob, &300);
-        
-        // Transfer B -> A (reverse)
-        client.transfer(&bob, &alice, &300);
+            // Invariant: allowance decreased by exactly the spent amount
+            assert_eq!(
+                allowance_before - allowance_after,
+                200,
+                "INVARIANT VIOLATION: Allowance not reduced correctly"
+            );
+        }
 
-        // After round-trip, balances should be back to original
-        assert_eq!(
-            client.balance_of(&alice),
-            alice_initial,
-            "PROPERTY VIOLATION: Round-trip transfer didn't restore sender balance"
-        );
-        assert_eq!(
-            client.balance_of(&bob),
-            bob_initial,
-            "PROPERTY VIOLATION: Round-trip transfer didn't restore receiver balance"
-        );
+        #[test]
+        #[should_panic]
+        fn invariant_allowance_cannot_exceed_approval() {
+            let (env, client, _) = setup_fresh();
+            let owner = Address::generate(&env);
+            let spender = Address::generate(&env);
+            let recipient = Address::generate(&env);
+            let token_id = 1u64;
+
+            client.mint(&owner, &token_id, &1000);
+            client.approve(&owner, &spender, &token_id, &100, &FAR_FUTURE_LEDGER);
+
+            // Attempting to spend more than approved should fail
+            client.transfer_from(&spender, &owner, &recipient, &token_id, &150);
+        }
+
+        // =========================================================================
+        // INVARIANT 5: No Double Spend
+        // =========================================================================
+        /// A user cannot spend the same tokens twice (either directly or via approval).
+        #[test]
+        #[should_panic]
+        fn invariant_no_double_spend_direct() {
+            let (env, client, _) = setup_fresh();
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+            let carol = Address::generate(&env);
+            let token_id = 1u64;
+
+            client.mint(&alice, &token_id, &100);
+
+            // First transfer succeeds
+            client.transfer(&alice, &bob, &token_id, &60);
+
+            // Alice now has 40, trying to spend 60 more should fail
+            client.transfer(&alice, &carol, &token_id, &60);
+        }
+
+        // =========================================================================
+        // INVARIANT 6: Total Supply Monotonicity
+        // =========================================================================
+        /// Total supply only increases via mint and only decreases via burn.
+        /// Transfers do not affect total supply.
+        #[test]
+        fn invariant_supply_only_changes_via_mint_burn() {
+            let (env, client, _) = setup_fresh();
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+            let token_id = 1u64;
+
+            let initial_supply = client.total_supply(&token_id);
+            assert_eq!(initial_supply, 0);
+
+            // Mint increases supply
+            client.mint(&alice, &token_id, &500);
+            assert_eq!(client.total_supply(&token_id), 500);
+
+            // Transfer does not change supply
+            client.transfer(&alice, &bob, &token_id, &200);
+            assert_eq!(
+                client.total_supply(&token_id),
+                500,
+                "INVARIANT VIOLATION: Transfer changed total supply"
+            );
+
+            // Approve does not change supply
+            client.approve(&alice, &bob, &token_id, &100, &FAR_FUTURE_LEDGER);
+            assert_eq!(
+                client.total_supply(&token_id),
+                500,
+                "INVARIANT VIOLATION: Approve changed total supply"
+            );
+
+            // Burn decreases supply
+            client.burn(&alice, &token_id, &100);
+            assert_eq!(client.total_supply(&token_id), 400);
+        }
+
+        // =========================================================================
+        // INVARIANT 7: Zero Address Handling
+        // =========================================================================
+        /// The contract should handle zero amounts appropriately.
+        #[test]
+        #[should_panic]
+        fn invariant_mint_zero_rejected() {
+            let (env, client, _) = setup_fresh();
+            let user = Address::generate(&env);
+            let token_id = 1u64;
+
+            client.mint(&user, &token_id, &0);
+        }
+
+        #[test]
+        #[should_panic]
+        fn invariant_burn_zero_rejected() {
+            let (env, client, _) = setup_fresh();
+            let user = Address::generate(&env);
+            let token_id = 1u64;
+
+            client.mint(&user, &token_id, &100);
+            client.burn(&user, &token_id, &0);
+        }
+
+        // =========================================================================
+        // INVARIANT 8: Idempotency Properties
+        // =========================================================================
+        /// Certain operations should have predictable idempotent-like behavior.
+        #[test]
+        fn invariant_approve_overwrites() {
+            let (env, client, _) = setup_fresh();
+            let owner = Address::generate(&env);
+            let spender = Address::generate(&env);
+            let token_id = 1u64;
+
+            client.approve(&owner, &spender, &token_id, &100, &FAR_FUTURE_LEDGER);
+            assert_eq!(client.allowance(&owner, &spender, &token_id), 100);
+
+            // New approval should overwrite, not add
+            client.approve(&owner, &spender, &token_id, &200, &FAR_FUTURE_LEDGER);
+            assert_eq!(
+                client.allowance(&owner, &spender, &token_id),
+                200,
+                "INVARIANT VIOLATION: Approve did not overwrite previous allowance"
+            );
+        }
+
+        // =========================================================================
+        // PROPERTY-BASED INVARIANT TESTS
+        // =========================================================================
+        /// These tests verify invariants across sequences of random-ish operations.
+
+        #[test]
+        fn property_sequence_invariant() {
+            let (env, client, _) = setup_fresh();
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+            let carol = Address::generate(&env);
+            let token_id = 1u64;
+
+            // Sequence of operations that should maintain invariants
+            client.mint(&alice, &token_id, &1000); // Alice: 1000
+            client.mint(&bob, &token_id, &500); // Bob: 500
+            client.transfer(&alice, &bob, &token_id, &200); // Alice: 800, Bob: 700
+            client.approve(&bob, &carol, &token_id, &300, &FAR_FUTURE_LEDGER);
+            client.transfer_from(&carol, &bob, &alice, &token_id, &150); // Alice: 950, Bob: 550
+            client.burn(&alice, &token_id, &100); // Total supply reduced by 100
+
+            // Verify final invariants
+            let total_balance = client.balance_of(&alice, &token_id)
+                + client.balance_of(&bob, &token_id)
+                + client.balance_of(&carol, &token_id);
+
+            assert_eq!(
+                client.total_supply(&token_id),
+                total_balance,
+                "PROPERTY VIOLATION: Supply invariant broken after operation sequence"
+            );
+
+            assert!(
+                client.balance_of(&alice, &token_id) >= 0
+                    && client.balance_of(&bob, &token_id) >= 0
+                    && client.balance_of(&carol, &token_id) >= 0,
+                "PROPERTY VIOLATION: Negative balance detected"
+            );
+        }
+
+        #[test]
+        fn property_mint_burn_symmetry() {
+            let (env, client, _) = setup_fresh();
+            let user = Address::generate(&env);
+            let token_id = 1u64;
+
+            // Mint then burn same amount should return to initial state
+            let initial_supply = client.total_supply(&token_id);
+            let initial_balance = client.balance_of(&user, &token_id);
+
+            client.mint(&user, &token_id, &500);
+            client.burn(&user, &token_id, &500);
+
+            assert_eq!(
+                client.total_supply(&token_id),
+                initial_supply,
+                "PROPERTY VIOLATION: Mint-burn symmetry broken for supply"
+            );
+            assert_eq!(
+                client.balance_of(&user, &token_id),
+                initial_balance,
+                "PROPERTY VIOLATION: Mint-burn symmetry broken for balance"
+            );
+        }
+
+        #[test]
+        fn property_transfer_reversibility_check() {
+            let (env, client, _) = setup_fresh();
+            let alice = Address::generate(&env);
+            let bob = Address::generate(&env);
+            let token_id = 1u64;
+
+            client.mint(&alice, &token_id, &1000);
+
+            let alice_initial = client.balance_of(&alice, &token_id);
+            let bob_initial = client.balance_of(&bob, &token_id);
+
+            // Transfer A -> B
+            client.transfer(&alice, &bob, &token_id, &300);
+
+            // Transfer B -> A (reverse)
+            client.transfer(&bob, &alice, &token_id, &300);
+
+            // After round-trip, balances should be back to original
+            assert_eq!(
+                client.balance_of(&alice, &token_id),
+                alice_initial,
+                "PROPERTY VIOLATION: Round-trip transfer didn't restore sender balance"
+            );
+            assert_eq!(
+                client.balance_of(&bob, &token_id),
+                bob_initial,
+                "PROPERTY VIOLATION: Round-trip transfer didn't restore receiver balance"
+            );
+        }
     }
 }

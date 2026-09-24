@@ -1,5 +1,15 @@
-import { createHmac, timingSafeEqual } from 'crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import logger from '../utils/logger';
+import { traceAsync, SpanKind } from '../utils/tracing';
+import configService from './config.service';
+import { notificationService } from './notification.service';
+import {
+  buildIdempotencyKey,
+  buildWebhookDeliveryHash,
+  defaultWebhookDeliveryStore,
+  type WebhookDeliveryStore,
+} from './idempotentWebhook.service';
+import { enqueueWebhookRetry } from './webhookRetry.queue';
 
 export interface TransactionWebhookRecord {
   id: string;
@@ -10,6 +20,21 @@ export interface TransactionWebhookRecord {
   status: string;
   externalId?: string | null;
   stellarTxId?: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  user?: {
+    publicKey: string;
+  } | null;
+}
+
+export interface KycWebhookRecord {
+  id: string;
+  userId: string;
+  provider?: string | null;
+  providerRef?: string | null;
+  status: string;
+  rejectionReasons?: string[] | string | null;
+  rejectionReasonCodes?: string[] | null;
   createdAt: Date;
   updatedAt: Date;
   user?: {
@@ -35,6 +60,28 @@ export interface TransactionStatusChangedPayload {
     updatedAt: string;
   };
 }
+
+export interface CustomerKycStatusUpdatedPayload {
+  event: 'customer.kyc_status_updated';
+  occurredAt: string;
+  previousStatus: string;
+  customer: {
+    id: string;
+    userId: string;
+    account?: string;
+    provider?: string;
+    providerRef?: string;
+    status: string;
+    rejectionReasons?: string[];
+    rejectionReasonCodes?: string[];
+    createdAt: string;
+    updatedAt: string;
+  };
+}
+
+export type KycStatusChangedPayload = CustomerKycStatusUpdatedPayload;
+
+type WebhookPayload = TransactionStatusChangedPayload | CustomerKycStatusUpdatedPayload;
 
 export interface WebhookConfig {
   url?: string;
@@ -79,6 +126,8 @@ interface WebhookServiceDependencies {
   httpClient?: WebhookHttpClient;
   sleep?: (ms: number) => Promise<void>;
   logger?: WebhookLogger;
+  deliveryStore?: WebhookDeliveryStore;
+  enqueueRetry?: typeof enqueueWebhookRetry;
 }
 
 export interface TransactionStatusUpdateDependencies {
@@ -111,13 +160,16 @@ const defaultHttpClient: WebhookHttpClient = async (url, init) => {
   };
 };
 
-export const loadWebhookConfigFromEnv = (): WebhookConfig => ({
-  url: process.env.WEBHOOK_URL,
-  secret: process.env.WEBHOOK_SECRET,
-  timeoutMs: Number.parseInt(process.env.WEBHOOK_TIMEOUT_MS || '5000', 10),
-  maxRetries: Number.parseInt(process.env.WEBHOOK_MAX_RETRIES || '3', 10),
-  retryDelayMs: Number.parseInt(process.env.WEBHOOK_RETRY_DELAY_MS || '500', 10),
-});
+export const loadWebhookConfigFromEnv = (): WebhookConfig => {
+  const cfg = configService.getConfig();
+  return {
+    url: cfg.WEBHOOK_URL,
+    secret: cfg.WEBHOOK_SECRET,
+    timeoutMs: cfg.WEBHOOK_TIMEOUT_MS,
+    maxRetries: cfg.WEBHOOK_MAX_RETRIES,
+    retryDelayMs: cfg.WEBHOOK_RETRY_DELAY_MS,
+  };
+};
 
 export const buildTransactionStatusChangedPayload = (
   transaction: TransactionWebhookRecord,
@@ -140,6 +192,49 @@ export const buildTransactionStatusChangedPayload = (
     updatedAt: transaction.updatedAt.toISOString(),
   },
 });
+
+export const buildCustomerKycStatusUpdatedPayload = (
+  customer: KycWebhookRecord,
+  previousStatus: string,
+  rejectionReasons?: string[] | string
+): CustomerKycStatusUpdatedPayload => {
+  let reasons: string[] | undefined;
+  if (rejectionReasons) {
+    reasons = Array.isArray(rejectionReasons) ? rejectionReasons : [rejectionReasons];
+  } else if (customer.rejectionReasonCodes && customer.rejectionReasonCodes.length > 0) {
+    reasons = customer.rejectionReasonCodes;
+  } else if (customer.rejectionReasons) {
+    reasons = Array.isArray(customer.rejectionReasons)
+      ? customer.rejectionReasons
+      : [customer.rejectionReasons];
+  }
+
+  const isRejected = customer.status.toUpperCase() === 'REJECTED';
+
+  return {
+    event: 'customer.kyc_status_updated',
+    occurredAt: new Date().toISOString(),
+    previousStatus,
+    customer: {
+      id: customer.id,
+      userId: customer.userId,
+      ...(customer.user?.publicKey ? { account: customer.user.publicKey } : {}),
+      ...(customer.provider ? { provider: customer.provider } : {}),
+      ...(customer.providerRef ? { providerRef: customer.providerRef } : {}),
+      status: customer.status,
+      ...(isRejected && reasons && reasons.length > 0
+        ? {
+            rejectionReasons: reasons,
+            rejectionReasonCodes: reasons,
+          }
+        : {}),
+      createdAt: customer.createdAt.toISOString(),
+      updatedAt: customer.updatedAt.toISOString(),
+    },
+  };
+};
+
+export const buildKycStatusChangedPayload = buildCustomerKycStatusUpdatedPayload;
 
 export const signWebhookPayload = (payload: string, secret: string, timestamp: string): string => {
   const digest = createHmac('sha256', secret)
@@ -168,22 +263,41 @@ export const verifyWebhookSignature = (
 
 export class WebhookService {
   private readonly httpClient: WebhookHttpClient;
-
   private readonly sleepFn: (ms: number) => Promise<void>;
-
   private readonly log: WebhookLogger;
+  private readonly injectedConfig?: WebhookConfig;
+  private readonly deliveryStore: WebhookDeliveryStore;
+  private readonly enqueueRetry: typeof enqueueWebhookRetry;
 
   constructor(
-    private readonly config: WebhookConfig = loadWebhookConfigFromEnv(),
+    injectedConfig?: WebhookConfig,
     dependencies: WebhookServiceDependencies = {}
   ) {
+    this.injectedConfig = injectedConfig;
     this.httpClient = dependencies.httpClient ?? defaultHttpClient;
     this.sleepFn = dependencies.sleep ?? sleep;
     this.log = dependencies.logger ?? logger;
+    this.deliveryStore = dependencies.deliveryStore ?? defaultWebhookDeliveryStore;
+    this.enqueueRetry = dependencies.enqueueRetry ?? enqueueWebhookRetry;
+  }
+
+  private getConfig(): WebhookConfig {
+    if (this.injectedConfig) {
+      return this.injectedConfig;
+    }
+    const cfg = configService.getConfig();
+    return {
+      url: cfg.WEBHOOK_URL,
+      secret: cfg.WEBHOOK_SECRET,
+      timeoutMs: cfg.WEBHOOK_TIMEOUT_MS ?? 5000,
+      maxRetries: cfg.WEBHOOK_MAX_RETRIES ?? 3,
+      retryDelayMs: cfg.WEBHOOK_RETRY_DELAY_MS ?? 1000,
+    };
   }
 
   isEnabled(): boolean {
-    return Boolean(this.config.url && this.config.secret);
+    const config = this.getConfig();
+    return Boolean(config.url && config.secret);
   }
 
   async sendTransactionStatusChanged(
@@ -210,105 +324,246 @@ export class WebhookService {
     }
 
     const payload = buildTransactionStatusChangedPayload(transaction, previousStatus);
-    return this.deliver(payload, transaction.id);
+    // Prefer SEP-24 for deposit/withdraw; fall back to generic transaction protocol.
+    const protocol =
+      transaction.type === 'DEPOSIT' ||
+      transaction.type === 'WITHDRAW' ||
+      transaction.type === 'deposit' ||
+      transaction.type === 'withdrawal'
+        ? 'sep24'
+        : 'transaction';
+    const idempotencyKey = buildIdempotencyKey({
+      protocol,
+      transactionId: transaction.id,
+      previousStatus,
+      nextStatus: transaction.status,
+    });
+    return this.deliver(payload, transaction.id, idempotencyKey);
+  }
+
+  async sendKycStatusChanged(
+    customer: KycWebhookRecord,
+    previousStatus: string,
+    rejectionReasons?: string[] | string
+  ): Promise<WebhookDeliveryResult> {
+    if (customer.status === previousStatus) {
+      return {
+        delivered: false,
+        attempts: 0,
+        skipped: true,
+      };
+    }
+
+    if (!this.isEnabled()) {
+      this.log.info('Skipping KYC webhook delivery because webhook configuration is incomplete', {
+        customerId: customer.id,
+      });
+      return {
+        delivered: false,
+        attempts: 0,
+        skipped: true,
+      };
+    }
+
+    const payload = buildCustomerKycStatusUpdatedPayload(customer, previousStatus, rejectionReasons);
+    const idempotencyKey = buildIdempotencyKey({
+      protocol: 'sep12',
+      transactionId: customer.id,
+      previousStatus,
+      nextStatus: customer.status,
+    });
+    return this.deliver(payload, customer.id, idempotencyKey);
+  }
+
+  async sendCustomerKycStatusUpdated(
+    customer: KycWebhookRecord,
+    previousStatus: string,
+    rejectionReasons?: string[] | string
+  ): Promise<WebhookDeliveryResult> {
+    return this.sendKycStatusChanged(customer, previousStatus, rejectionReasons);
   }
 
   private async deliver(
-    payload: TransactionStatusChangedPayload,
-    transactionId: string
+    payload: WebhookPayload,
+    entityId: string,
+    idempotencyKey: string
+  ): Promise<WebhookDeliveryResult> {
+    const config = this.getConfig();
+    
+    return traceAsync(
+      'webhook.deliver',
+      async (span) => {
+        span.setAttribute('webhook.entity_id', entityId);
+        span.setAttribute('webhook.event_type', payload.event);
+        span.setAttribute('webhook.url', config.url || 'unknown');
+        span.setAttribute('webhook.idempotency_key', idempotencyKey);
+
+        return this.executeDeliveryLoop(payload, entityId, config, idempotencyKey);
+      },
+      SpanKind.CLIENT,
+      {
+        'webhook.url': config.url ?? '',
+        'webhook.max_retries': config.maxRetries,
+      }
+    );
+  }
+
+  private async executeDeliveryLoop(
+    payload: WebhookPayload,
+    entityId: string,
+    config: WebhookConfig,
+    idempotencyKey: string
   ): Promise<WebhookDeliveryResult> {
     const requestBody = JSON.stringify(payload);
+    const deliveryHash = buildWebhookDeliveryHash({
+      idempotencyKey,
+      callbackUrl: config.url!,
+    });
+
+    if (await this.deliveryStore.hasBeenDelivered(deliveryHash)) {
+      this.log.info('Skipping duplicate webhook (already delivered)', {
+        entityId,
+        idempotencyKey,
+      });
+      return {
+        delivered: false,
+        attempts: 0,
+        skipped: true,
+      };
+    }
+
     let lastStatusCode: number | undefined;
     let lastResponseBody: string | undefined;
     let lastError: unknown;
 
-    for (let attempt = 1; attempt <= this.config.maxRetries + 1; attempt += 1) {
-      const timestamp = new Date().toISOString();
-      const signature = signWebhookPayload(requestBody, this.config.secret!, timestamp);
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    for (let attempt = 1; attempt <= config.maxRetries + 1; attempt += 1) {
+      const { result, error, statusCode, responseBody } = await this.performRequestAttempt(
+        payload, requestBody, config, attempt, entityId, idempotencyKey, deliveryHash
+      );
 
-      try {
-        const response = await this.httpClient(this.config.url!, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-anchorpoint-event': payload.event,
-            'x-anchorpoint-signature': signature,
-            'x-anchorpoint-timestamp': timestamp,
-            'x-anchorpoint-delivery-attempt': String(attempt),
-          },
-          body: requestBody,
-          signal: controller.signal,
-        });
-
-        clearTimeout(timeout);
-        lastStatusCode = response.status;
-        lastResponseBody = await response.text();
-
-        if (response.ok) {
-          this.log.info('Webhook delivered successfully', {
-            transactionId,
-            attempts: attempt,
-            statusCode: response.status,
+      if (result) {
+        if (result.delivered) {
+          await this.deliveryStore.markDelivered(deliveryHash);
+        } else if (!result.skipped) {
+          await this.enqueueRetry({
+            protocol: idempotencyKey.split(':')[0] || 'transaction',
+            transactionId: entityId,
+            previousStatus: 'previousStatus' in payload ? payload.previousStatus : 'unknown',
+            nextStatus:
+              'transaction' in payload
+                ? payload.transaction.status
+                : payload.customer.status,
+            callbackUrl: config.url!,
+            idempotencyKey,
+            deliveryHash,
+            payload: requestBody,
+            attempt,
           });
-          return {
-            delivered: true,
-            attempts: attempt,
-            statusCode: response.status,
-            responseBody: lastResponseBody,
-          };
         }
-
-        if (!RETRYABLE_STATUS_CODES.has(response.status) || attempt > this.config.maxRetries) {
-          this.log.warn('Webhook delivery failed without further retries', {
-            transactionId,
-            attempts: attempt,
-            statusCode: response.status,
-          });
-          return {
-            delivered: false,
-            attempts: attempt,
-            statusCode: response.status,
-            responseBody: lastResponseBody,
-            error: `Webhook responded with status ${response.status}`,
-          };
-        }
-      } catch (error) {
-        clearTimeout(timeout);
-        lastError = error;
-
-        if (attempt > this.config.maxRetries) {
-          this.log.error('Webhook delivery exhausted retries after request error', {
-            transactionId,
-            attempts: attempt,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          return {
-            delivered: false,
-            attempts: attempt,
-            statusCode: lastStatusCode,
-            responseBody: lastResponseBody,
-            error: error instanceof Error ? error.message : 'Unknown webhook error',
-          };
-        }
+        return result;
       }
+      
+      if (statusCode !== undefined) lastStatusCode = statusCode;
+      if (responseBody !== undefined) lastResponseBody = responseBody;
+      if (error !== undefined) lastError = error;
 
       await this.sleepFn(this.getRetryDelay(attempt));
     }
 
-    return {
-      delivered: false,
-      attempts: this.config.maxRetries + 1,
-      statusCode: lastStatusCode,
-      responseBody: lastResponseBody,
-      error: lastError instanceof Error ? lastError.message : 'Webhook delivery failed',
+    await this.enqueueRetry({
+      protocol: idempotencyKey.split(':')[0] || 'transaction',
+      transactionId: entityId,
+      previousStatus: 'previousStatus' in payload ? payload.previousStatus : 'unknown',
+      nextStatus:
+        'transaction' in payload ? payload.transaction.status : payload.customer.status,
+      callbackUrl: config.url!,
+      idempotencyKey,
+      deliveryHash,
+      payload: requestBody,
+      attempt: config.maxRetries + 1,
+    });
+
+    return { 
+      delivered: false, 
+      attempts: config.maxRetries + 1, 
+      statusCode: lastStatusCode, 
+      responseBody: lastResponseBody, 
+      error: lastError instanceof Error ? lastError.message : 'Webhook delivery failed' 
     };
   }
 
-  private getRetryDelay(attempt: number): number {
-    return this.config.retryDelayMs * 2 ** (attempt - 1);
+  private async performRequestAttempt(
+    payload: WebhookPayload,
+    requestBody: string,
+    config: WebhookConfig,
+    attempt: number,
+    entityId: string,
+    idempotencyKey: string,
+    _deliveryHash: string
+  ): Promise<{ result?: WebhookDeliveryResult; error?: unknown; statusCode?: number; responseBody?: string }> {
+    const timestamp = new Date().toISOString();
+    const signature = signWebhookPayload(requestBody, config.secret!, timestamp);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+
+    try {
+      const response = await this.httpClient(config.url!, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+          'x-anchorpoint-event': payload.event,
+          'x-anchorpoint-signature': signature,
+          'x-anchorpoint-timestamp': timestamp,
+          'x-anchorpoint-delivery-attempt': String(attempt),
+        },
+        body: requestBody,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+      const statusCode = response.status;
+      const responseBody = await response.text();
+
+      if (response.ok) {
+        this.log.info('Webhook delivered successfully', { entityId, attempts: attempt, statusCode, idempotencyKey });
+        return { result: { delivered: true, attempts: attempt, statusCode, responseBody } };
+      }
+
+      if (!RETRYABLE_STATUS_CODES.has(statusCode) || attempt > config.maxRetries) {
+        this.log.warn('Webhook delivery failed without further retries', { entityId, attempts: attempt, statusCode, idempotencyKey });
+        return { result: { delivered: false, attempts: attempt, statusCode, responseBody, error: `Webhook responded with status ${statusCode}` } };
+      }
+
+      return { statusCode, responseBody };
+    } catch (error) {
+      clearTimeout(timeout);
+      
+      if (attempt > config.maxRetries) {
+        this.log.error('Webhook delivery exhausted retries after request error', { entityId, attempts: attempt, error: error instanceof Error ? error.message : String(error), idempotencyKey });
+        return { result: { delivered: false, attempts: attempt, error: error instanceof Error ? error.message : 'Unknown webhook error' } };
+      }
+      
+      return { error };
+    }
   }
+
+
+  getRetryDelay(attempt: number): number {
+    const config = this.getConfig();
+    const initialDelay = config.retryDelayMs || 2000;
+    return calculateFullJitterBackoff(attempt, initialDelay, 3600000);
+  }
+}
+
+export function calculateFullJitterBackoff(
+  attempt: number,
+  initialDelayMs: number = 2000,
+  maxDelayMs: number = 3600000
+): number {
+  const exponentialCap = Math.min(maxDelayMs, initialDelayMs * 2 ** Math.max(0, attempt - 1));
+  // Randomized full jitter between initialDelayMs and exponentialCap (or 0 and exponentialCap)
+  return Math.floor(Math.random() * (exponentialCap + 1));
 }
 
 export const defaultWebhookService = new WebhookService();
@@ -322,69 +577,90 @@ export const updateTransactionStatusAndNotify = async ({
   transaction: TransactionWebhookRecord;
   webhookDelivery: WebhookDeliveryResult;
 }> => {
-  const existingTransaction = await prisma.transaction.findUnique({
-    where: { id: transactionId },
-    include: {
-      user: {
-        select: {
-          publicKey: true,
+  return traceAsync(
+    'transaction.update_status_and_notify',
+    async (span) => {
+      span.setAttribute('transaction.id', transactionId);
+      span.setAttribute('transaction.next_status', nextStatus);
+      
+      const existingTransaction = await prisma.transaction.findUnique({
+        where: { id: transactionId },
+        include: {
+          user: {
+            select: {
+              publicKey: true,
+            },
+          },
         },
-      },
-    },
-  });
+      });
 
-  if (!existingTransaction) {
-    throw new Error(`Transaction ${transactionId} not found`);
-  }
+      if (!existingTransaction) {
+        throw new Error(`Transaction ${transactionId} not found`);
+      }
 
-  if (existingTransaction.status === nextStatus) {
-    return {
-      transaction: existingTransaction,
-      webhookDelivery: {
-        delivered: false,
-        attempts: 0,
-        skipped: true,
-      },
-    };
-  }
+      if (existingTransaction.status === nextStatus) {
+        return {
+          transaction: existingTransaction,
+          webhookDelivery: {
+            delivered: false,
+            attempts: 0,
+            skipped: true,
+          },
+        };
+      }
 
-  const updatedTransaction = await prisma.transaction.update({
-    where: { id: transactionId },
-    data: { status: nextStatus },
-    include: {
-      user: {
-        select: {
-          publicKey: true,
+      const updatedTransaction = await prisma.transaction.update({
+        where: { id: transactionId },
+        data: { status: nextStatus },
+        include: {
+          user: {
+            select: {
+              publicKey: true,
+            },
+          },
         },
-      },
+      });
+
+      // Trigger Notification Engine
+      const notificationMessage = `Your transaction ${transactionId} status updated to: ${nextStatus.replace('_', ' ')}`;
+      notificationService.notify(updatedTransaction.userId, notificationMessage, transactionId).catch((err) => {
+        logger.error('Notification engine failed in webhook service', {
+          transactionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+      try {
+        const webhookDelivery = await webhookService.sendTransactionStatusChanged(
+          updatedTransaction,
+          existingTransaction.status
+        );
+
+        return {
+          transaction: updatedTransaction,
+          webhookDelivery,
+        };
+      } catch (error) {
+        logger.error('Transaction status updated but webhook delivery threw unexpectedly', {
+          transactionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+
+        return {
+          transaction: updatedTransaction,
+          webhookDelivery: {
+            delivered: false,
+            attempts: 1,
+            error: error instanceof Error ? error.message : 'Unknown webhook error',
+          },
+        };
+      }
     },
-  });
-
-  try {
-    const webhookDelivery = await webhookService.sendTransactionStatusChanged(
-      updatedTransaction,
-      existingTransaction.status
-    );
-
-    return {
-      transaction: updatedTransaction,
-      webhookDelivery,
-    };
-  } catch (error) {
-    logger.error('Transaction status updated but webhook delivery threw unexpectedly', {
-      transactionId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    return {
-      transaction: updatedTransaction,
-      webhookDelivery: {
-        delivered: false,
-        attempts: 1,
-        error: error instanceof Error ? error.message : 'Unknown webhook error',
-      },
-    };
-  }
+    SpanKind.INTERNAL,
+    {
+      'transaction.operation': 'update_status_and_notify',
+    }
+  );
 };
 
 export default defaultWebhookService;

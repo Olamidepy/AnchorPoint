@@ -1,0 +1,79 @@
+/**
+ * Relayer Types
+ * 
+ * Types for signature-based gasless token approval system
+ */
+
+export interface TokenApprovalRequest {
+  userPublicKey: string;
+  spenderPublicKey: string;
+  amount: string;
+  assetCode?: string;
+  assetIssuer?: string;
+  nonce: string;
+  expiry: number; // Unix timestamp
+  signature: string; // Base64 encoded signature
+}
+
+export interface TokenApprovalResponse {
+  success: boolean;
+  transactionHash?: string;
+  error?: string;
+}
+
+export interface SignedTransactionRequest {
+  signedTransactionXdr: string;
+  networkPassphrase: string;
+}
+
+export interface RelayerConfig {
+  relayerPublicKey: string;
+  relayerSecretKey: string;
+  maxAmount: string;
+  allowedSpenders: string[];
+  expiryWindowSeconds: number;
+  baseFee?: number;
+  surgeMultiplier?: number;
+  maxFeeCap?: number;
+  dynamicFeesEnabled?: boolean;
+}
+
+export interface SignatureVerificationResult {
+  valid: boolean;
+  publicKey?: string;
+  error?: string;
+}
+
+export interface ApprovalTransaction {
+  transactionXdr: string;
+  networkPassphrase: string;
+  fee: number;
+  operations: number;
+}
+
+export interface FeeEstimateResponse {
+  baseFee: number;
+  recommendedFee: number;
+  surgeMultiplier: number;
+  maxFeeCap: number;
+  modeFee?: number;
+  p90Fee?: number;
+  minFee?: number;
+  maxFee?: number;
+  ledgerCapacityUsage?: number;
+}
+
+export interface FeeBumpRequest {
+  transactionXdr: string;
+  networkPassphrase?: string;
+  maxFee?: number;
+}
+
+export interface FeeBumpResponse {
+  success: boolean;
+  feeBumpTransactionXdr?: string;
+  transactionHash?: string;
+  fee?: number;
+  error?: string;
+}
+
