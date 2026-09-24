@@ -2,6 +2,8 @@ import jwt from 'jsonwebtoken';
 import { randomBytes } from 'node:crypto';
 
 import { RedisService } from './redis.service';
+import { redis } from '../lib/redis';
+import { revokeToken as blacklistToken, isTokenRevoked } from './jwt-blacklist.service';
 
 import { traceAsync, traceSync, SpanKind } from '../utils/tracing';
 import configService from './config.service';
@@ -61,7 +63,9 @@ export interface MultiKeyVerifiedToken {
 }
 
 const CHALLENGE_TTL_SECONDS = 300; // 5 minutes
+const DEFAULT_REVOCATION_TTL_SECONDS = 3600; // fallback when token has no exp claim
 const JWT_SECRET = configService.getConfig().JWT_SECRET;
+const defaultRedisService = new RedisService(redis as any);
 
 export const extractBearerToken = (authorization?: string): string | null => {
   if (!authorization?.startsWith('Bearer ')) return null;
@@ -88,15 +92,23 @@ export const signToken = (publicKey: string, multiKeyData?: MultiKeyVerifiedToke
   );
 };
 
-export const verifyToken = (token: string): VerifiedToken | MultiKeyVerifiedToken => {
-  return traceSync(
+export const verifyToken = async (
+  token: string,
+  redisService: RedisService = defaultRedisService
+): Promise<VerifiedToken | MultiKeyVerifiedToken> => {
+  return traceAsync(
     'auth.verify_token',
-    (span) => {
+    async (span) => {
       span.setAttribute('auth.token_length', token.length);
+
+      if (await isTokenRevoked(redisService, token)) {
+        throw new Error('Token has been revoked');
+      }
+
       const decoded = jwt.verify(token, configService.getConfig().JWT_SECRET) as any;
       if (!decoded?.sub) throw new Error('Invalid token payload');
       span.setAttribute('auth.subject', decoded.sub);
-      
+
       // Return appropriate type based on presence of multi-key fields
       if (decoded.signers && decoded.threshold && decoded.authLevel) {
         return decoded as MultiKeyVerifiedToken;
@@ -104,6 +116,28 @@ export const verifyToken = (token: string): VerifiedToken | MultiKeyVerifiedToke
       return { sub: decoded.sub };
     },
     SpanKind.INTERNAL
+  );
+};
+
+/**
+ * Revokes a JWT so it can no longer be used for authentication.
+ * Stores the token in the Redis blacklist for its remaining lifetime.
+ */
+export const revokeToken = async (
+  token: string,
+  redisService: RedisService = defaultRedisService
+): Promise<void> => {
+  return traceAsync(
+    'auth.revoke_token',
+    async (span) => {
+      const decoded = jwt.decode(token) as { exp?: number } | null;
+      const ttlSeconds = decoded?.exp
+        ? Math.max(decoded.exp - Math.floor(Date.now() / 1000), 1)
+        : DEFAULT_REVOCATION_TTL_SECONDS;
+      span.setAttribute('auth.ttl_seconds', ttlSeconds);
+      await blacklistToken(redisService, token, ttlSeconds);
+    },
+    SpanKind.CLIENT
   );
 };
 

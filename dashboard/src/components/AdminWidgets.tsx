@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { 
   AlertTriangle, 
   ShieldAlert, 
@@ -10,8 +10,11 @@ import {
   Wallet, 
   ExternalLink,
   CheckCircle2,
-  TrendingDown
+  TrendingDown,
+  Pause,
+  Play
 } from 'lucide-react';
+import { ConfirmModal } from './ConfirmModal';
 
 export interface VaultRecord {
   id: string;
@@ -628,4 +631,188 @@ export const AdminWidgets: React.FC<AdminWidgetsProps> = ({
   );
 };
 
+// ---------------------------------------------------------------------------
+// PauseControlsWidget
+// ---------------------------------------------------------------------------
+
+/** Feature flag names backing each pause level. */
+const PAUSE_LEVELS = [
+  {
+    key: 'sep24.enabled',
+    label: 'Global Pause',
+    description: 'Disables all SEP-24 hosted deposit and withdrawal flows anchor-wide.',
+  },
+  {
+    key: 'sep24.deposit',
+    label: 'Deposits Paused',
+    description: 'Blocks new SEP-24 hosted deposits while withdrawals continue normally.',
+  },
+  {
+    key: 'contract.swap',
+    label: 'Swaps Paused',
+    description: 'Disables Swap contract interactions.',
+  },
+] as const;
+
+interface FeatureFlagState {
+  enabled: boolean;
+}
+
+interface PauseControlsWidgetProps {
+  /** Base URL of the backend API, e.g. "http://localhost:3002" */
+  apiBaseUrl: string;
+}
+
+const PauseControlsWidget: React.FC<PauseControlsWidgetProps> = ({ apiBaseUrl }) => {
+  const [flags, setFlags] = useState<Record<string, FeatureFlagState>>({});
+  const [loading, setLoading] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<{ text: string; isError: boolean } | null>(null);
+  const [pendingLevel, setPendingLevel] = useState<(typeof PAUSE_LEVELS)[number] | null>(null);
+
+  const authHeaders = useCallback((): Record<string, string> => {
+    const token = localStorage.getItem('authToken');
+    return {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+  }, []);
+
+  const fetchFlags = useCallback(async () => {
+    try {
+      const res = await fetch(`${apiBaseUrl}/feature-flags`, { headers: authHeaders() });
+      if (!res.ok) throw new Error(`Server responded with ${res.status}`);
+      const body = await res.json();
+      const next: Record<string, FeatureFlagState> = {};
+      for (const flag of (body.data ?? []) as { name: string; enabled: boolean }[]) {
+        next[flag.name] = { enabled: flag.enabled };
+      }
+      setFlags(next);
+    } catch (err) {
+      setStatusMessage({
+        text: err instanceof Error ? err.message : 'Failed to load pause status.',
+        isError: true,
+      });
+    }
+  }, [apiBaseUrl, authHeaders]);
+
+  useEffect(() => {
+    void fetchFlags();
+  }, [fetchFlags]);
+
+  const isPaused = (levelKey: string): boolean => flags[levelKey]?.enabled === false;
+
+  const showStatus = (text: string, isError: boolean) => {
+    setStatusMessage({ text, isError });
+    setTimeout(() => setStatusMessage(null), 5000);
+  };
+
+  const handleToggleConfirm = async () => {
+    if (!pendingLevel) return;
+    const level = pendingLevel;
+    setPendingLevel(null);
+    setLoading(true);
+
+    const nextAction = isPaused(level.key) ? 'enable' : 'disable';
+
+    try {
+      const res = await fetch(`${apiBaseUrl}/feature-flags/${level.key}/${nextAction}`, {
+        method: 'PUT',
+        headers: authHeaders(),
+      });
+      if (!res.ok) throw new Error(`Failed to update '${level.label}'`);
+
+      setFlags((prev) => ({ ...prev, [level.key]: { enabled: nextAction === 'enable' } }));
+      showStatus(
+        `${level.label} ${nextAction === 'enable' ? 'resumed' : 'paused'} successfully.`,
+        false,
+      );
+    } catch (err) {
+      showStatus(err instanceof Error ? err.message : `Failed to update '${level.label}'.`, true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="glass-card p-6">
+      <h3 className="mb-1 flex items-center gap-2 text-lg font-bold text-slate-100">
+        <ShieldAlert size={18} className="text-rose-400" aria-hidden="true" />
+        Emergency Pause Controls
+      </h3>
+      <p className="mb-4 text-sm text-slate-400">
+        Toggling a pause level takes effect immediately and requires confirmation.
+      </p>
+
+      {statusMessage && (
+        <div
+          role="alert"
+          className={`mb-4 rounded-lg border p-3 text-sm ${
+            statusMessage.isError
+              ? 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+              : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+          }`}
+        >
+          {statusMessage.text}
+        </div>
+      )}
+
+      <div className="space-y-3">
+        {PAUSE_LEVELS.map((level) => {
+          const paused = isPaused(level.key);
+          return (
+            <div
+              key={level.key}
+              className="flex flex-col gap-3 rounded-lg border border-slate-800 bg-slate-950/40 p-4 sm:flex-row sm:items-center sm:justify-between"
+            >
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <h4 className="font-semibold text-slate-200">{level.label}</h4>
+                  <span
+                    className={`rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
+                      paused ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/20 text-emerald-300'
+                    }`}
+                  >
+                    {paused ? 'Paused' : 'Active'}
+                  </span>
+                </div>
+                <p className="text-xs leading-relaxed text-slate-500">{level.description}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingLevel(level)}
+                disabled={loading}
+                className={`action-button flex shrink-0 items-center justify-center gap-1.5 rounded-lg border px-4 py-2 text-sm font-medium disabled:opacity-40 ${
+                  paused
+                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
+                    : 'border-rose-500/30 bg-rose-500/10 text-rose-400 hover:bg-rose-500/20'
+                }`}
+              >
+                {paused ? <Play size={14} aria-hidden="true" /> : <Pause size={14} aria-hidden="true" />}
+                {paused ? 'Resume' : 'Pause'}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      <ConfirmModal
+        isOpen={pendingLevel !== null}
+        title={pendingLevel ? `${isPaused(pendingLevel.key) ? 'Resume' : 'Pause'} ${pendingLevel.label}?` : ''}
+        message={
+          pendingLevel
+            ? isPaused(pendingLevel.key)
+              ? `Are you sure you want to resume "${pendingLevel.label}"? This will restore normal operation immediately.`
+              : `Are you sure you want to pause "${pendingLevel.label}"? This will take effect immediately for all users.`
+            : ''
+        }
+        confirmText={pendingLevel ? (isPaused(pendingLevel.key) ? 'Resume' : 'Pause') : 'Confirm'}
+        isDanger={pendingLevel ? !isPaused(pendingLevel.key) : true}
+        onConfirm={() => void handleToggleConfirm()}
+        onCancel={() => setPendingLevel(null)}
+      />
+    </div>
+  );
+};
+
+export { PauseControlsWidget };
 export default AdminWidgets;

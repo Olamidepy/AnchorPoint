@@ -54,6 +54,34 @@ export class StellarService {
     return [networkConfig.sorobanRpcUrl];
   }
 
+  private static readonly RETRYABLE_HORIZON_STATUS_CODES = [429, 502, 503, 504];
+
+  /**
+   * Wraps a Horizon request with retries (exponential backoff + jitter) for
+   * transient failures (rate limiting, gateway/service errors).
+   */
+  private async retryHorizonRequest<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
+    let lastError: any;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error: any) {
+        lastError = error;
+        const statusCode = error?.response?.status;
+        if (attempt === maxRetries || !StellarService.RETRYABLE_HORIZON_STATUS_CODES.includes(statusCode)) {
+          throw error;
+        }
+        const backoffMs = 2 ** attempt * 500;
+        const jitterMs = Math.random() * 250;
+        logger.warn(
+          `Horizon request failed with status ${statusCode}, retrying (attempt ${attempt + 1}/${maxRetries})`
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffMs + jitterMs));
+      }
+    }
+    throw lastError;
+  }
+
   private async executeRpcWithFailover<T>(method: string, ...args: any[]): Promise<T> {
     const errors: Error[] = [];
     for (let i = 0; i < this.rpcUrls.length; i++) {
@@ -165,7 +193,7 @@ export class StellarService {
    */
   public async getAccountSigners(accountId: string): Promise<AccountSigners> {
     const server = this.getHorizonServer();
-    const account = await server.loadAccount(accountId);
+    const account = await this.retryHorizonRequest(() => server.loadAccount(accountId));
 
     return {
       signers: account.signers.map((signer: any) => ({
@@ -179,6 +207,19 @@ export class StellarService {
         high_threshold: account.thresholds.high_threshold
       }
     };
+  }
+
+  /**
+   * Checks whether an account holds a trustline for the given asset.
+   * Useful as a pre-flight check before submitting payout transactions.
+   */
+  public async hasTrustline(accountPublicKey: string, assetCode: string, assetIssuer: string): Promise<boolean> {
+    const server = this.getHorizonServer();
+    const account = await this.retryHorizonRequest(() => server.loadAccount(accountPublicKey));
+
+    return account.balances.some((balance: any) =>
+      balance.asset_code === assetCode && balance.asset_issuer === assetIssuer
+    );
   }
 
   /**
@@ -368,7 +409,7 @@ export class StellarService {
         );
       }
 
-      const response = await server.submitTransaction(finalTx);
+      const response = await this.retryHorizonRequest(() => server.submitTransaction(finalTx));
       logger.info(`Transaction submitted successfully: ${response.hash}`);
       return response;
     } catch (error: any) {
@@ -418,6 +459,21 @@ export class StellarService {
       return { status: 'UP' };
     } catch (error) {
       logger.error('Soroban RPC health check failed:', error);
+      return { status: 'DOWN' };
+    }
+  }
+
+  /**
+   * Health check for Horizon connectivity
+   */
+  public async getHorizonHealth(): Promise<{ status: 'UP' | 'DOWN' }> {
+    try {
+      const server = this.getHorizonServer();
+      // Lightweight, low-cost endpoint used purely as a connectivity check
+      await server.fetchBaseFee();
+      return { status: 'UP' };
+    } catch (error) {
+      logger.error('Horizon health check failed:', error);
       return { status: 'DOWN' };
     }
   }
