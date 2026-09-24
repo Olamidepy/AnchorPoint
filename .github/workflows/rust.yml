@@ -29,7 +29,16 @@ jobs:
       - name: Build (wasm32)
         run: cargo build --target wasm32v1-none --release
 
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: WASM Optimization & Size Threshold Check
+        run: |
+          chmod +x tools/optimize-wasm.sh
+          ./tools/optimize-wasm.sh target/wasm32v1-none/release
+
       - uses: taiki-e/install-action@v2
+
         with:
           tool: cargo-scout-audit@0.3.16
 

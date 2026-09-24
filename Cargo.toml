@@ -36,4 +36,5 @@ strip = true
 debug-assertions = false
 panic = "abort"
 codegen-units = 1
-lto = "fat"
+lto = true
+
