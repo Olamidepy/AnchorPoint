@@ -295,7 +295,7 @@ export const refreshToken = async (
   const token = authHeader.split(' ')[1];
 
   try {
-    const decoded = verifyToken(token);
+    const decoded = await verifyToken(token);
 
     let multiKeyData: MultiKeyVerifiedToken | undefined;
     if ('signers' in decoded) {

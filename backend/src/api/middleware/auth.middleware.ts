@@ -17,7 +17,7 @@ export interface AuthRequest extends Request {
   };
 }
 
-export const authMiddleware = (req: AuthRequest, res: Response, next: NextFunction) => {
+export const authMiddleware = async (req: AuthRequest, res: Response, next: NextFunction) => {
   const token = extractBearerToken(req.headers.authorization);
   if (!token) {
     return res.status(401).json({
@@ -27,7 +27,7 @@ export const authMiddleware = (req: AuthRequest, res: Response, next: NextFuncti
   }
 
   try {
-    const decoded = verifyToken(token);
+    const decoded = await verifyToken(token);
     
     // Handle both single-key and multi-key tokens
     if ((decoded as MultiKeyVerifiedToken).signers) {
