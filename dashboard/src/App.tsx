@@ -6,15 +6,22 @@ import {
   History, 
   Settings, 
   ShieldCheck,
-  Menu,
-  X,
-  Wallet
+  Menu, 
+  X, 
+  Wallet,
+  AlertTriangle,
+  Terminal
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// Dummy components for sections
+import { AdminWidgets } from './components/AdminWidgets';
+import { ContractPlayground } from './components/ContractPlayground';
+import { TransactionHistory } from './components/TransactionHistory';
+import { KycFileUpload } from './components/KycFileUpload';
+
+// Dashboard Overview with Liquidation Monitor integrated
 const DashboardOverview = () => (
-  <div className="space-y-6">
+  <div className="space-y-8">
     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
       {[
         { label: 'Total Volume', value: '$128,430.00', change: '+12.5%' },
@@ -32,56 +39,28 @@ const DashboardOverview = () => (
         </div>
       ))}
     </div>
-    
-    <div className="glass-card p-6 h-64 flex items-center justify-center">
-      <p className="text-slate-500 italic">Volume Chart Placeholder</p>
-    </div>
-  </div>
-);
 
-const TransactionHistory = () => (
-  <div className="glass-card overflow-x-auto">
-    <table className="w-full text-left">
-      <thead>
-        <tr className="border-b border-slate-800 text-slate-400 text-sm">
-          <th className="p-4 font-medium">Type</th>
-          <th className="p-4 font-medium">Asset</th>
-          <th className="p-4 font-medium">Amount</th>
-          <th className="p-4 font-medium">Status</th>
-          <th className="p-4 font-medium">Date</th>
-        </tr>
-      </thead>
-      <tbody className="divide-y divide-slate-800">
-        {[
-          { type: 'Deposit', asset: 'USDC', amount: '500.00', status: 'Completed', date: '2024-03-15' },
-          { type: 'Withdrawal', asset: 'USDC', amount: '120.50', status: 'Pending', date: '2024-03-16' },
-          { type: 'Deposit', asset: 'USDC', amount: '1,000.00', status: 'Processing', date: '2024-03-16' },
-        ].map((tx, i) => (
-          <tr key={i} className="hover:bg-slate-900/50 transition-colors">
-            <td className="p-4 flex items-center gap-2">
-              {tx.type === 'Deposit' ? <ArrowDownLeft size={16} className="text-emerald-400" /> : <ArrowUpRight size={16} className="text-rose-400" />}
-              {tx.type}
-            </td>
-            <td className="p-4">{tx.asset}</td>
-            <td className="p-4 font-mono">${tx.amount}</td>
-            <td className="p-4">
-              <span className={`px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                tx.status === 'Completed' ? 'bg-emerald-500/10 text-emerald-400' : 
-                tx.status === 'Pending' ? 'bg-amber-500/10 text-amber-400' : 'bg-blue-500/10 text-blue-400'
-              }`}>
-                {tx.status}
-              </span>
-            </td>
-            <td className="p-4 text-slate-400 text-sm">{tx.date}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    {/* Real-time Liquidation Monitor Panel */}
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h3 className="text-lg font-bold font-display text-slate-100 flex items-center gap-2">
+            <AlertTriangle size={18} className="text-rose-400" />
+            Liquidation Vaults & Health Factor Monitoring
+          </h3>
+          <p className="text-xs text-slate-400">
+            Real-time pool solvency tracking. Vaults with Health Factor &lt; 1.1 are highlighted in red for liquidators.
+          </p>
+        </div>
+      </div>
+      <AdminWidgets />
+    </div>
   </div>
 );
 
 const SEP24Flow = ({ type }: { type: 'deposit' | 'withdraw' }) => {
   const [step, setStep] = useState(1);
+  const [uploadedKyc, setUploadedKyc] = useState(false);
   
   return (
     <div className="max-w-2xl mx-auto glass-card p-8">
@@ -133,19 +112,33 @@ const SEP24Flow = ({ type }: { type: 'deposit' | 'withdraw' }) => {
             initial={{ opacity: 0, x: 20 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: -20 }}
-            className="space-y-4"
+            className="space-y-6"
           >
-            <h2 className="text-2xl font-bold font-display">Identity Verification</h2>
-            <p className="text-slate-400">This anchor requires KYC for this transaction. Please complete the interactive flow.</p>
-            <div className="bg-slate-900 aspect-video rounded-xl border border-dashed border-slate-700 flex flex-col items-center justify-center p-6 text-center">
-              <ShieldCheck size={48} className="text-primary mb-4" />
-              <p className="font-medium text-slate-300">Stellar Anchor Secure KYC</p>
-              <p className="text-sm text-slate-500 mt-2">Placeholder for SEP-12 Interactive WebView</p>
+            <div>
+              <h2 className="text-2xl font-bold font-display">SEP-12 Identity Verification</h2>
+              <p className="text-slate-400 text-sm mt-1">
+                Please upload required KYC identification to satisfy compliance rules before initiating your {type}.
+              </p>
+            </div>
+
+            <KycFileUpload 
+              documentTypeLabel="Government Photo ID (Passport or Driver's License)"
+              onUploadComplete={() => setUploadedKyc(true)}
+            />
+
+            <div className="flex justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setStep(1)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-sm"
+              >
+                Back
+              </button>
               <button 
                 onClick={() => setStep(3)}
-                className="btn-primary mt-6"
+                className="btn-primary"
               >
-                Launch KYC Portal
+                {uploadedKyc ? 'Continue to Confirmation' : 'Skip & Continue'}
               </button>
             </div>
           </motion.div>
@@ -181,10 +174,12 @@ const App = () => {
 
   const menuItems = [
     { id: 'dashboard', icon: LayoutDashboard, label: 'Overview' },
+    { id: 'liquidation', icon: AlertTriangle, label: 'Liquidation Vaults' },
+    { id: 'playground', icon: Terminal, label: 'Contract Caller' },
     { id: 'deposit', icon: ArrowDownLeft, label: 'Deposit' },
     { id: 'withdraw', icon: ArrowUpRight, label: 'Withdraw' },
     { id: 'history', icon: History, label: 'History' },
-    { id: 'kyc', icon: ShieldCheck, label: 'KYC Status' },
+    { id: 'kyc', icon: ShieldCheck, label: 'KYC Documents' },
     { id: 'settings', icon: Settings, label: 'Settings' },
   ];
 
@@ -254,10 +249,13 @@ const App = () => {
               {menuItems.find(m => m.id === activeTab)?.label}
             </h2>
             <p className="text-slate-400 mt-1">
-              {activeTab === 'dashboard' && 'Manage your anchor operations and liquidity.'}
+              {activeTab === 'dashboard' && 'Manage your anchor operations, volume, and monitor vault health factors.'}
+              {activeTab === 'liquidation' && 'Real-time vault risk factor monitoring and 1-click liquidator triggers.'}
+              {activeTab === 'playground' && 'Directly invoke and test Soroban smart contract methods.'}
               {activeTab === 'deposit' && 'Initiate a new on-ramp transaction via SEP-24.'}
               {activeTab === 'withdraw' && 'Initiate a new off-ramp transaction via SEP-24.'}
-              {activeTab === 'history' && 'Track historical and pending transactions.'}
+              {activeTab === 'history' && 'Track historical and pending transactions with 60 FPS row virtualization.'}
+              {activeTab === 'kyc' && 'SEP-12 Identity and customer verification document upload center.'}
             </p>
           </div>
 
@@ -270,14 +268,23 @@ const App = () => {
               transition={{ duration: 0.2 }}
             >
               {activeTab === 'dashboard' && <DashboardOverview />}
+              {activeTab === 'liquidation' && <AdminWidgets />}
+              {activeTab === 'playground' && <ContractPlayground />}
               {activeTab === 'deposit' && <SEP24Flow type="deposit" />}
               {activeTab === 'withdraw' && <SEP24Flow type="withdraw" />}
               {activeTab === 'history' && <TransactionHistory />}
               {activeTab === 'kyc' && (
-                <div className="glass-card p-12 text-center">
-                  <ShieldCheck size={64} className="mx-auto text-primary mb-4" />
-                  <h3 className="text-xl font-bold">Identity Verification</h3>
-                  <p className="text-slate-400 mt-2">All customers are currently verified.</p>
+                <div className="space-y-6 max-w-3xl">
+                  <div className="glass-card p-6 border border-slate-800">
+                    <h3 className="text-lg font-bold font-display mb-1 text-slate-100">
+                      Customer KYC Verification Documents (SEP-12)
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Upload your identity documentation. Files are verified for format, size, and encrypted client-side.
+                    </p>
+                  </div>
+                  <KycFileUpload documentTypeLabel="Government Photo ID (Passport or Driver's License)" />
+                  <KycFileUpload documentTypeLabel="Proof of Residence (Utility Bill, Bank Statement < 3 months)" />
                 </div>
               )}
               {activeTab === 'settings' && (
@@ -307,7 +314,7 @@ const App = () => {
         </section>
       </main>
     </div>
-  )
-}
+  );
+};
 
 export default App;
